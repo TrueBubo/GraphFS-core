@@ -15,6 +15,8 @@ algorithm; see [What we learned](#what-we-learned) for the short version.
 | `ReplicaPlacer.kt` | the central placer: sees the whole graph and the true placement |
 | `Placer.kt` | the interface both placers implement (add / remove file, traversal, stats) |
 | `DistributedPlacer.kt` | the same algorithm run by the servers, each knowing only its own files and what it learnt from traffic |
+| `PairCounts.kt` | what a distributed server remembers of traversed pairs: every pair, or a count-min sketch, behind one interface |
+| `PairMemoryCheck.kt` | the memory estimate of the distributed placer against the real heap |
 | `Eviction.kt` | cache eviction policies: LRU, FIFO, Random, CLOCK, LFU, SLRU, ARC, W-TinyLFU, Belady |
 | `CacheSimulation.kt` | runs a placer as a cache of at most `maxFiles` files, each eviction policy in its own thread |
 | `WikiPrep.kt`, `WikiSimulation.kt` | Wikipedia clickstream: conversion to a binary file, and the replay |
@@ -417,8 +419,7 @@ it is over the limit an eviction policy picks a file to remove.
   the first time is new and is placed freely (an upload; near placement applies here). A file
   that was evicted earlier is restored on the servers it is still stored on (`restoreFile`);
   only a replica whose server is now at its cap (or down) is copied elsewhere, and that copy
-  costs α like any other move. (Until 2026-10-28, a returning file was placed as if new, which
-  gave it a free relocation; see [Free relocations](#free-relocations-before-the-fix).)
+  costs α like any other move.
 - **Miss %**: the share of touched files that had to be loaded.
 - **Local %**: the share of traversals with both files on a common server, adaptive placer.
 - **Saved %**: `1 − adaptive cost / static cost`, where cost is `remote traversals + α · copies`
@@ -713,6 +714,69 @@ on Linux LRU) and its load stays within 10 % of the average.
   where newcomers land.
 - Not measured: racks together with `distances` where crossing racks costs more. There, the
   second replica's rack would also matter for traversals.
+
+## Pair memory: a count-min sketch
+
+A distributed server keeps every pair it has seen for as long as the pair has weight, about 13.3
+half-lives, so its memory grows with the pairs in use. `PairCounts` hides how they are kept, with
+`pairCounts` as an option of `DistributedPlacer`:
+
+- `ExactCounts`: a `HashMap` of pairs per replica, as before. About 117 bytes per pair, of which
+  16 are data. The results are the same as before the interface: 660 of 660 comparable rows of
+  `data/distributed.csv` matched exactly.
+- `SketchCounts`: one count-min sketch per server (4 rows of 32-bit counters), with forward decay
+  and conservative update. A sketch can say how heavy a pair is, but cannot list a file's pairs,
+  which evaluations, moves and removals need. So each replica also keeps the ids of up to 16 heavy
+  neighbours; a new neighbour replaces the lightest one if the sketch says it weighs more.
+
+The `*-cms` variants use 4 cells per row per replica a server holds, rounded up to a power of 2.
+That sets the size from `maxFiles`, not from the files actually present. A moved replica adds its
+weights to the new server's sketch. Its old weights stay in the old sketch until they fade, as a
+sketch cannot forget one pair.
+
+Memory below is an estimate from object sizes, at the peak window, over all 16 servers. It counts
+pairs and location caches, not what both versions need anyway (which files a server holds). Static
+placers keep exact pairs, so all variants of a dataset share a baseline.
+
+| dist-near, LRU | files | pairs, exact | pairs, sketch | + locations, exact | + locations, sketch | saved %, exact | saved %, sketch |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Twitter (whole trace) | 10,000 | 3.9 MB | 3.1 MB | 25.5 MB | 24.5 MB | 50.2 | 50.9 |
+| | 304,198 | 126 MB | 99 MB | 148 MB | 117 MB | 63.6 | 62.9 |
+| Linux (whole history) | 10,000 | 4.8 MB | 3.2 MB | 19.9 MB | 18.0 MB | 58.5 | 60.9 |
+| | 156,764 | 129 MB | 53 MB | 155 MB | 78 MB | 72.5 | 72.0 |
+| Wikipedia (50M traversals) | 100,000 | 38.5 MB | 27.3 MB | 96 MB | 84 MB | 37.1 | 42.2 |
+| | 1,000,000 | 864 MB | 267 MB | 1,178 MB | 555 MB | 48.9 | 48.6 |
+| | 2,000,000 | 1,314 MB | 526 MB | 1,758 MB | 922 MB | 49.1 | 48.8 |
+| | 3,267,066 | 1,378 MB | 843 MB | 1,822 MB | 1,236 MB | 49.1 | 48.9 |
+
+(`data/distributed-memory.csv`. Charts in `docs/distributed/`: `memory.png`, `memory-scaling.png`,
+`memory-tradeoff.png`; the `*-cms` variants are also in the existing ones.)
+
+- **The saving grows with the pairs per file.** Up to 3.2 times less for pairs on Wikipedia (1M
+  files) and 2.4 on Linux, for 0.5 points of saved cost. Twitter has few pairs per file, so most of
+  its 99 MB is the sketch itself.
+- **Memory still grows with files.** It no longer depends on the pairs per file, but the sketch and
+  the neighbour ids are per replica. The last Wikipedia row is oversized: 50M traversals bring in
+  no more pairs than at 2M files, while the sketch follows `maxFiles`.
+- **The location cache is untouched,** and it is often the larger part: 22 of 25 MB on Twitter at
+  10,000 files, and over half of the total on Wikipedia at 1M files with the sketch.
+- **A sketch can be smaller, up to a point.** On the sweep in `data/distributed-sweep.csv`, 2 cells
+  per row per replica keep the saving: 41.4 % on Wikipedia at 100,000 files (19 MB), 72.0 on Linux
+  (37 MB), 62.9 on Twitter (65 MB). At 1 cell, Wikipedia falls to 35.4 %. Linux and Twitter do not
+  mind, but the default stays at 4 for the margin.
+- **Neighbours matter more than cells on sparse traces.** On Linux, 4 neighbours lose 2 points and
+  32 neighbours match exact pairs, or slightly beat them; on Twitter, 32 get within 0.1 point.
+- **The sketch beats exact pairs on small caches, partly by accident.** It saves 2.4 points more on
+  Linux and 2.5 on Wikipedia at 10,000 and 100,000 files (10M traversals; 5.1 at 50M). An evicted
+  file's weights survive in the sketch, while exact pairs drop them. With a salted hash that makes
+  those weights unreachable, the lead falls to 1.7 and 1.0 points, and on Twitter from +0.7 to −0.2.
+  So remembering pairs across evictions has value of its own; the rest of the lead is not
+  explained.
+- **The estimate against the heap** (`./gradlew pairMemoryCheck`, Parallel GC, every file in the
+  placer): Twitter exact 148 MB estimated, 227 MB of heap; sketch 117 and 175. Linux exact 155 and
+  163; sketch 78 and 96–106 (two runs). The heap also holds the file lists the estimate leaves out. With G1, the
+  default, large arrays waste regions: the Twitter sketch took 239 MB against 204 MB for exact pairs,
+  so at that size it saves nothing in practice unless made smaller.
 
 ## What we learned
 

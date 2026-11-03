@@ -1,5 +1,4 @@
 import kotlin.math.ceil
-import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.min
 import kotlin.random.Random
@@ -18,12 +17,15 @@ data class Protocol(
     var trueGain: Double = 0.0,
 )
 
+/** Bytes a [DistributedPlacer] keeps over all its servers to place files, by structure; [pairs] is the pairs remembered. */
+data class PairMemory(val pairs: Long, val pairBytes: Long, val locationBytes: Long)
+
 /**
  * The algorithm of [ReplicaPlacer] (rent-or-buy trigger, exact relocate/swap gains, capped
  * servers) run by the servers themselves, each knowing only what it could know in a real cluster:
- *  - the files it stores, and for each the pairs it has seen traversed and their decayed weights.
- *    A traversal is seen by the server that served each end, so a file's pairs are spread over
- *    its replicas;
+ *  - the files it stores, and for each the pairs it has seen traversed and their decayed weights,
+ *    kept by [pairCounts] (every pair, or a sketch). A traversal is seen by the server that served
+ *    each end, so a file's pairs are spread over its replicas;
  *  - a location cache: where other files' replicas were when it last heard. Every remote
  *    traversal tells both ends where the other file is (piggybacked on the request and reply).
  *    For files it holds itself it knows exactly, as the replicas of a file know each other.
@@ -81,6 +83,7 @@ class DistributedPlacer(
     val oracle: Boolean = false,
     val placeNear: Boolean = false,
     val racks: IntArray? = null,
+    private val pairCounts: (lambda: Double) -> PairCounts = ::ExactCounts,
     seed: Long = 1L,
 ) : Placer {
     private val n = servers.size
@@ -99,17 +102,15 @@ class DistributedPlacer(
     internal var sweepEvery = SWEEP_EVERY
 
     /** One replica's view of its file: the pairs this server saw, and its share of the debt. */
-    private class Local(val file: Int, var index: Int) {
-        val edges = HashMap<Int, Edge>()
+    private class Local(val file: Int, var index: Int, var pairs: FilePairs) {
         var debt = 0.0
     }
-
-    private class Edge(var weight: Double, var time: Long)
 
     /** Where another file's replicas were last heard to be, and the sweep's last pass that found a pair naming it. */
     private class Cached(val file: Int, var replicas: IntArray, var seen: Int, var index: Int)
 
     private inner class Node {
+        val counts = pairCounts(lambda)           // the pairs of the files held here
         val held = HashMap<Int, Local>()          // files with a replica here
         val list = ArrayList<Local>()             // the same, for random picks and the sweep; Local.index is the position
         val cache = HashMap<Int, Cached>()        // file -> its replicas, as last heard
@@ -170,11 +171,7 @@ class DistributedPlacer(
                     nextFile = 0
                     pass++
                 }
-                val it = list[nextFile++].edges.entries.iterator()
-                while (it.hasNext()) {
-                    val (g, e) = it.next()
-                    if (weightOf(e) < PRUNE) it.remove() else cache[g]?.seen = pass
-                }
+                list[nextFile++].pairs.forEachLive(now) { g, _ -> cache[g]?.seen = pass }
             }
             cacheCredit += cacheList.size / period
             while (cacheCredit >= 1.0 && cacheList.isNotEmpty()) {
@@ -193,6 +190,12 @@ class DistributedPlacer(
                 }
             }
         }
+
+        /** Bytes of the pairs, and of the location cache (its replica arrays counted as this server's own). */
+        val pairBytes: Long get() = counts.bytes + arrayBytes(list.size, 4) + list.sumOf { it.pairs.bytes }
+        val locationBytes: Long
+            get() = hashMapBytes(cache.size) + arrayBytes(cacheList.size, 4) +
+                cache.size * (HASH_NODE + BOXED_INT + CACHED + arrayBytes(replicaCount, 4))
     }
 
     // The world. Replica arrays are replaced, never changed, so caches can share them.
@@ -201,13 +204,20 @@ class DistributedPlacer(
     // Files that left the placer (evictFile) stay stored on their servers and take disk space there.
     private val evicted = HashMap<Int, IntArray>()            // file -> the servers it is stored on
     private val cold = IntArray(n)                            // server -> replicas of evicted files on it
+    private val lambda = ln(2.0) / halfLife
     private val nodes = Array(n) { Node() }
     private val rng = Random(seed)
-    private val lambda = ln(2.0) / halfLife
     private val totalCapacity = servers.sumOf { it.toLong() }
     private var now = 0L
 
     override val fileCount: Int get() = replicas.size
+
+    /** What the servers keep for the pairs and locations right now; O(files held), for measurements. */
+    val memory: PairMemory
+        get() = PairMemory(
+            nodes.sumOf { node -> node.list.sumOf { it.pairs.count.toLong() } },
+            nodes.sumOf { it.pairBytes }, nodes.sumOf { it.locationBytes },
+        )
 
     override fun addFile(file: Int) = addFile(file, -1)
 
@@ -273,7 +283,7 @@ class DistributedPlacer(
             home.loads[t]++
             if (!copies || j >= kept) home.disks[t]++
             load[t]++
-            nodes[t].add(file, Local(file, 0))
+            nodes[t].add(file, Local(file, 0, nodes[t].counts.open(file)))
         }
         replicas[file] = chosen
         protocol.messages += replicaCount                  // upload (or keep) orders
@@ -285,10 +295,9 @@ class DistributedPlacer(
         protocol.messages += r.size
         val told = HashSet<Int>()
         for (s in r) {
-            val node = nodes[s]
-            for (g in node.held.getValue(file).edges.keys) {
-                for (h in known(s, g) ?: continue) {
-                    nodes[h].held[g]?.edges?.remove(file)
+            nodes[s].held.getValue(file).pairs.forEach(now) { g, _ ->
+                for (h in known(s, g) ?: return@forEach) {
+                    nodes[h].held[g]?.pairs?.remove(file)
                     if (told.add(h)) protocol.messages++
                 }
             }
@@ -341,10 +350,7 @@ class DistributedPlacer(
     }
 
     private fun observe(s: Int, f: Int, g: Int) {
-        val l = nodes[s].held[f] ?: return
-        val e = l.edges.getOrPut(g) { Edge(0.0, now) }
-        e.weight = weightOf(e) + 1.0
-        e.time = now
+        nodes[s].held[f]?.pairs?.add(g, now)
     }
 
     private fun charge(s: Int, f: Int) {
@@ -363,16 +369,8 @@ class DistributedPlacer(
         val where = HashMap<Int, IntArray>()
         for (h in listOf(s) + a.filter { it != s }) {      // own view first: its locations win
             if (h != s) protocol.messages += 2
-            val node = nodes[h]
-            val l = node.held[f] ?: continue
-            val it = l.edges.entries.iterator()
-            while (it.hasNext()) {
-                val (g, e) = it.next()
-                val w = weightOf(e)
-                if (w < PRUNE) {                           // faded: forget it now, not at the sweep
-                    it.remove()
-                    continue
-                }
+            val l = nodes[h].held[f] ?: continue
+            l.pairs.forEachLive(now) { g, w ->             // faded pairs go now, not at the sweep
                 weight.merge(g, w, Double::plus)
                 if (g !in where) known(h, g)?.let { where[g] = it }
             }
@@ -453,12 +451,15 @@ class DistributedPlacer(
             val x = node.list[rng.nextInt(node.list.size)].file
             val ax = replicas.getValue(x)
             if (x == f || from in ax || !keepsSpread(ax, ax.indexOf(t), from)) return@repeat
-            val edges = node.held.getValue(x).edges
-            val nbrs = edges.keys.filter { it == f || known(t, it) != null }
-            if (nbrs.isEmpty()) return@repeat
-            val ws = DoubleArray(nbrs.size) { weightOf(edges.getValue(nbrs[it])) }
-            val na = Array(nbrs.size) { if (nbrs[it] == f) fAfter else known(t, nbrs[it])!! }
-            val gx = gains(ax, ws, na)[ax.indexOf(t)][from]
+            val ws = ArrayList<Double>()
+            val na = ArrayList<IntArray>()
+            node.held.getValue(x).pairs.forEach(now) { g, w ->
+                val at = if (g == f) fAfter else known(t, g) ?: return@forEach
+                ws.add(w)
+                na.add(at)
+            }
+            if (ws.isEmpty()) return@repeat
+            val gx = gains(ax, ws.toDoubleArray(), na.toTypedArray())[ax.indexOf(t)][from]
             if (gx > Double.NEGATIVE_INFINITY && (best == null || gx > best!!.second)) best = x to gx
         }
         return best
@@ -475,7 +476,8 @@ class DistributedPlacer(
         if (swapFile >= 0) {
             val ax = replicas.getValue(swapFile)
             val xAfter = ax.copyOf().also { it[ax.indexOf(t)] = from }
-            val xWeight = nodes[t].held.getValue(swapFile).edges.mapValues { weightOf(it.value) }
+            val xWeight = LinkedHashMap<Int, Double>()
+            nodes[t].held.getValue(swapFile).pairs.forEach(now) { g, w -> xWeight[g] = w }
             actual += trueGain(swapFile, ax, xAfter, xWeight, ignore = -1)
             move(swapFile, t, from, xAfter)
             stats.swaps++
@@ -501,7 +503,8 @@ class DistributedPlacer(
         val l = nodes[from].remove(f)
         l.debt = 0.0
         val dst = nodes[to]
-        for (g in l.edges.keys) known(from, g)?.let { dst.cacheIfAbsent(g, it) }  // travel with the copy
+        l.pairs.forEach(now) { g, _ -> known(from, g)?.let { dst.cacheIfAbsent(g, it) } }  // travel with the copy
+        l.pairs = dst.counts.arrive(f, l.pairs, now)
         dst.add(f, l)
         replicas[f] = after
         load[from]--
@@ -589,8 +592,6 @@ class DistributedPlacer(
     /** Where server s believes g's replicas are: exact if it holds g (replicas know each other), else cached. */
     private fun known(s: Int, g: Int): IntArray? = if (g in nodes[s].held) replicas[g] else nodes[s].cached(g)
 
-    private fun weightOf(e: Edge): Double = e.weight * exp(-lambda * (now - e.time))
-
     private fun home(f: Int): Int = Math.floorMod(f, n)
 
     /** Replicas on the fullest server over the average per server (1 = perfectly even). */
@@ -642,8 +643,8 @@ class DistributedPlacer(
     }
 
     companion object {
-        const val PRUNE = 1e-4
         const val SWEEP_EVERY = 1L shl 18                  // traversals in which the sweep visits everything once
         const val SWAP_SAMPLE = 16
+        const val CACHED = 32L                             // bytes of a Cached object
     }
 }

@@ -87,7 +87,7 @@ tasks.register<JavaExec>("plotCaches") {
         listOf("twitter/sweep.csv", "wikipedia/sweep.csv", "linux/sweep.csv").map { data.file(it).asFile }.filter { it.exists() }.map { it.path })
 }
 
-/** ./gradlew distributed -Pdataset=twitter|wiki|linux [-PmaxFiles=...] [-Ppolicy=LRU]: central vs distributed placement. */
+/** ./gradlew distributed -Pdataset=twitter|wiki|linux [-PmaxFiles=...] [-Ppolicy=LRU] [-Pcsv=...] [-Pvariants=a,b]: central vs distributed placement. */
 tasks.register<JavaExec>("distributed") {
     mainClass = "DistributedSimulationKt"
     classpath = sourceSets.main.get().runtimeClasspath
@@ -102,12 +102,26 @@ tasks.register<JavaExec>("distributed") {
     }
     args(listOf(if (dataset == "linux") "linux" else if (wiki) "wiki" else "twitter", source) +
         (if (wiki) listOf((findProperty("traversals") ?: "10000000").toString()) else emptyList()) +
-        listOf((findProperty("maxFiles") ?: (if (wiki) "100000" else "10000")).toString(), (findProperty("policy") ?: "LRU").toString()))
+        listOf((findProperty("maxFiles") ?: (if (wiki) "100000" else "10000")).toString(), (findProperty("policy") ?: "LRU").toString(),
+            (findProperty("csv") ?: "").toString()) + listOfNotNull(findProperty("variants")?.toString()))
 }
 
-/** ./gradlew plotDistributed: charts of data/distributed.csv (DistributedSimulation runs with a csv) into docs/distributed/. */
+/** ./gradlew pairMemoryCheck -Pdataset=twitter|linux -Pcounts=exact|cms: the distributed placer's memory estimate against the heap. */
+tasks.register<JavaExec>("pairMemoryCheck") {
+    mainClass = "PairMemoryCheckKt"
+    classpath = sourceSets.main.get().runtimeClasspath
+    maxHeapSize = "6g"
+    jvmArgs("-XX:+UseParallelGC")
+    val dataset = (findProperty("dataset") ?: "twitter").toString()
+    val source = if (dataset == "linux") "data/linux/log.txt.gz" else "data/twitter/higgs-activity_time.txt.gz"
+    args(dataset, layout.projectDirectory.file(source).asFile.path, (findProperty("counts") ?: "cms").toString())
+}
+
+/** ./gradlew plotDistributed: charts of data/distributed*.csv (DistributedSimulation runs with a csv) into docs/distributed/. */
 tasks.register<JavaExec>("plotDistributed") {
     mainClass = "DistributedPlotKt"
     classpath = sourceSets.main.get().runtimeClasspath
-    args(layout.projectDirectory.dir("docs/distributed").asFile.path, layout.projectDirectory.file("data/distributed.csv").asFile.path)
+    val data = layout.projectDirectory.dir("data")
+    args(listOf(layout.projectDirectory.dir("docs/distributed").asFile.path) +
+        listOf("distributed.csv", "distributed-memory.csv", "distributed-sweep.csv").map { data.file(it).asFile }.filter { it.exists() }.map { it.path })
 }

@@ -1,3 +1,5 @@
+import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.random.Random
@@ -15,6 +17,8 @@ fun main() {
     distributedFuzz()
     distributedFuzz(notify = 8, placeNear = true, racks = intArrayOf(0, 0, 1, 1, 2, 2, 3, 3))
     distributedFuzz(verify = true)
+    distributedFuzz(notify = 8, placeNear = true, pairCounts = { SketchCounts(it, 64, neighbours = 4) })
+    sketchCheck()
     simulation()
     lruSimulation()
     rackSimulation(k = 1)
@@ -259,13 +263,64 @@ fun restoreFuzz() {
 }
 
 /**
+ * [SketchCounts] against [ExactCounts] on the same traversals. A sketch much larger than the pairs
+ * must give the exact weights, and when it is small it may overstate a pair but never understate
+ * it. Only the heaviest pairs have to stay among a file's neighbours.
+ */
+fun sketchCheck() {
+    val lambda = ln(2.0) / 1_000.0
+    val big = SketchCounts(lambda, 1 shl 20, neighbours = 64)
+    val small = SketchCounts(lambda, 32, neighbours = 8)
+    val exact = ExactCounts(lambda)
+    val files = (0 until 8).map { Triple(exact.open(it), big.open(it), small.open(it)) }
+    val rnd = Random(41)
+    val zipf = Zipf(32, 1.0, rnd)
+    for (t in 1L..20_000L) {
+        val (a, b, c) = files[rnd.nextInt(files.size)]
+        val g = zipf.next()
+        a.add(g, t)
+        b.add(g, t)
+        c.add(g, t)
+    }
+    val now = 20_000L
+    var overstated = 0.0
+    var total = 0.0
+    for ((a, b, c) in files) {
+        val truth = HashMap<Int, Double>()
+        a.forEach(now) { g, w -> truth[g] = w }
+        val seen = HashMap<Int, Double>()
+        b.forEach(now) { g, w -> seen[g] = w }
+        check(seen.keys == truth.keys) { "the large sketch lost pairs" }
+        for ((g, w) in truth) check(abs(seen.getValue(g) - w) <= 1e-4 * (1 + w)) { "pair with $g: ${seen[g]}, really $w" }
+        var count = 0
+        c.forEach(now) { g, w ->
+            val real = truth.getValue(g)
+            check(w >= real * (1 - 1e-4)) { "small sketch understates $g: $w, really $real" }
+            overstated += w - real
+            total += real
+            count++
+        }
+        check(count == c.count && count <= 8)
+        val heaviest = truth.maxBy { it.value }.key
+        var kept = false
+        c.forEach(now) { g, _ -> if (g == heaviest) kept = true }
+        check(kept) { "the heaviest neighbour $heaviest was dropped" }
+    }
+    println("== sketch check: exact weights with a large sketch; small sketch (4 x 32 counters, 8 neighbours) overstates kept pairs by %.1f %% in total ==".format(100 * overstated / total))
+    println()
+}
+
+/**
  * DistributedPlacer under random adds, removes and traversals, with a short half-life and sweep
  * period so pairs fade and are swept all the time: invariants after every step.
  */
-fun distributedFuzz(notify: Int = 0, verify: Boolean = false, placeNear: Boolean = false, racks: IntArray? = null) {
+fun distributedFuzz(
+    notify: Int = 0, verify: Boolean = false, placeNear: Boolean = false, racks: IntArray? = null,
+    pairCounts: (Double) -> PairCounts = ::ExactCounts,
+) {
     val p = DistributedPlacer(
         IntArray(8) { 60 }, 2, alpha = 2.0, halfLife = 50.0, gossipEvery = 20, notify = notify, verify = verify,
-        placeNear = placeNear, racks = racks, seed = 31,
+        placeNear = placeNear, racks = racks, pairCounts = pairCounts, seed = 31,
     )
     p.sweepEvery = 64
     val rnd = Random(37)

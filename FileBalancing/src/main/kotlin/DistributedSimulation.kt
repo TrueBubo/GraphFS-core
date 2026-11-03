@@ -6,10 +6,11 @@ import kotlin.random.Random
  * Central against distributed placement, on the same cache and the same traversals: does
  * placement still work when no server sees the whole graph?
  *
- * Usage: DistributedSimulation wiki <dir with links.bin> [traversals] [maxFiles] [policy] [csv]
- *        DistributedSimulation twitter <higgs-activity_time.txt.gz> [maxFiles] [policy] [csv]
- *        DistributedSimulation linux <log.txt.gz> [maxFiles] [policy] [csv]
- * With csv, appends one row per variant and window (header first if the file is new).
+ * Usage: DistributedSimulation wiki <dir with links.bin> [traversals] [maxFiles] [policy] [csv] [variants]
+ *        DistributedSimulation twitter <higgs-activity_time.txt.gz> [maxFiles] [policy] [csv] [variants]
+ *        DistributedSimulation linux <log.txt.gz> [maxFiles] [policy] [csv] [variants]
+ * With csv, appends one row per variant and window (header first if the file is new). variants
+ * is a comma-separated list of the names below; by default all but the cms-* size sweep run.
  * Defaults: 10M traversals and 100,000 files for Wikipedia (half-life 1M), the whole trace and
  * 10,000 files for Twitter (half-life 20,000); eviction policy LRU (any of Eviction.kt but Belady).
  *
@@ -25,14 +26,18 @@ import kotlin.random.Random
  *  - both:      notify8 and verify;
  *  - oracle:    diagnosis only, the protocol with every location known exactly at no cost;
  *  - dist-near: notify8, and a new file goes on the servers of the file it was reached from;
- *  - dist-near-rack: dist-near, keeping every file on two racks.
+ *  - dist-near-rack: dist-near, keeping every file on two racks;
+ *  - notify8-cms, dist-near-cms: notify8 and dist-near with pairs in a count-min sketch
+ *    ([SketchCounts]) of 4 rows of [CMS_CELLS] cells per replica a server holds, and 16 neighbours
+ *    per replica; their static baseline is the same as for the exact ones;
+ *  - cms-<c>-<m>: dist-near with <c> cells per row per replica held and <m> neighbours per replica.
  * Static placers never place near (that is part of what near is measured for), so the central
  * variants share one baseline and the distributed ones another.
  * The cost of a variant counts remote traversals and copies; the protocol's messages are listed
  * apart, per traversal.
  */
 fun main(args: Array<String>) {
-    val usage = "usage: DistributedSimulation wiki <dir> [traversals] [maxFiles] [policy] [csv] | twitter|linux <file.gz> [maxFiles] [policy] [csv]"
+    val usage = "usage: DistributedSimulation wiki <dir> [traversals] [maxFiles] [policy] [csv] [variants] | twitter|linux <file.gz> [maxFiles] [policy] [csv] [variants]"
     require(args.size >= 2) { usage }
     val title: String
     val files: Int
@@ -42,6 +47,7 @@ fun main(args: Array<String>) {
     val halfLife: Double
     val stream: () -> () -> Pair<Int, Int>
     val csv: File?
+    val only: List<String>?
     when (args[0]) {
         "wiki" -> {
             val clicks = Clicks.load(File(args[1], "links.bin"))
@@ -50,7 +56,8 @@ fun main(args: Array<String>) {
             traversals = args.getOrNull(2)?.toLong() ?: 10_000_000L
             maxFiles = args.getOrNull(3)?.toInt() ?: 100_000
             policy = args.getOrNull(4) ?: "LRU"
-            csv = args.getOrNull(5)?.let(::File)
+            csv = args.getOrNull(5)?.takeIf { it.isNotEmpty() }?.let(::File)
+            only = args.getOrNull(6)?.split(',')
             halfLife = 1_000_000.0
             stream = {
                 val rnd = Random(17)
@@ -64,7 +71,8 @@ fun main(args: Array<String>) {
             traversals = higgs.size.toLong()
             maxFiles = args.getOrNull(2)?.toInt() ?: 10_000
             policy = args.getOrNull(3) ?: "LRU"
-            csv = args.getOrNull(4)?.let(::File)
+            csv = args.getOrNull(4)?.takeIf { it.isNotEmpty() }?.let(::File)
+            only = args.getOrNull(5)?.split(',')
             halfLife = 20_000.0
             stream = higgs::stream
         }
@@ -75,7 +83,8 @@ fun main(args: Array<String>) {
             traversals = history.size.toLong()
             maxFiles = args.getOrNull(2)?.toInt() ?: 10_000
             policy = args.getOrNull(3) ?: "LRU"
-            csv = args.getOrNull(4)?.let(::File)
+            csv = args.getOrNull(4)?.takeIf { it.isNotEmpty() }?.let(::File)
+            only = args.getOrNull(5)?.split(',')
             halfLife = 100_000.0
             stream = history::stream
         }
@@ -87,7 +96,14 @@ fun main(args: Array<String>) {
     val alpha = 8.0
     val capacity = IntArray(n) { maxFiles }
     val racks = IntArray(n) { it / RACK_SIZE }
-    val variants: List<Pair<String, (Double) -> Placer>> = listOf(
+    // A server holds about k / n of the replicas in the placer; a smaller cache needs a smaller sketch.
+    val heldPerServer = (minOf(maxFiles, files).toLong() * k / n).toInt()
+    fun sketch(cells: Int, neighbours: Int): (Double) -> PairCounts = { SketchCounts(it, cells * heldPerServer, neighbours) }
+    fun nearCms(cells: Int, neighbours: Int) = "cms-$cells-$neighbours" to { a: Double ->
+        DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, pairCounts = sketch(cells, neighbours), seed = 3) as Placer
+    }
+    val sweep = CMS_SWEEP.map { (c, m) -> nearCms(c, m) }
+    val variants: List<Pair<String, (Double) -> Placer>> = listOf<Pair<String, (Double) -> Placer>>(
         "central" to { a -> ReplicaPlacer(capacity, k, alpha = a, halfLife = halfLife, seed = 3) },
         "cent-near" to { a -> ReplicaPlacer(capacity, k, alpha = a, halfLife = halfLife, placeNear = true, seed = 3) },
         "cent-rack" to { a -> ReplicaPlacer(capacity, k, alpha = a, halfLife = halfLife, racks = racks, seed = 3) },
@@ -99,7 +115,9 @@ fun main(args: Array<String>) {
         "oracle" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, oracle = true, seed = 3) },
         "dist-near" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, seed = 3) },
         "dist-near-rack" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, racks = racks, seed = 3) },
-    )
+        "notify8-cms" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, pairCounts = sketch(CMS_CELLS, CMS_NEIGHBOURS), seed = 3) },
+        "dist-near-cms" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, pairCounts = sketch(CMS_CELLS, CMS_NEIGHBOURS), seed = 3) },
+    ).let { all -> if (only == null) all else (all + sweep).filter { it.first in only } }
     println("== %s, %s eviction: central vs distributed placement; at most %,d of %,d files, %d servers, k = %d, alpha = %.0f, half-life %,.0f =="
         .format(title, policy, maxFiles, files, n, k, alpha, halfLife))
     val runs = variants.map { (label, make) ->
@@ -111,10 +129,11 @@ fun main(args: Array<String>) {
     runPolicies(title, maxFiles, traversals, alpha, runs, csv = null, stream = stream)
 
     if (csv != null) {
-        if (!csv.exists()) csv.writeText("dataset,policy,maxFiles,variant,traversals,remotePct,staticPct,copies,staticCopies\n")
+        if (!csv.exists()) csv.writeText("dataset,policy,maxFiles,variant,traversals,remotePct,staticPct,copies,staticCopies,pairs,pairBytes,locationBytes\n")
         csv.appendText(runs.joinToString("") { r ->
             r.windows.joinToString("") { w ->
-                "%s,%s,%d,%s,%d,%.4f,%.4f,%d,%d\n".format(Locale.ROOT, title, policy, maxFiles, r.name, w.end, w.remote, w.static, w.copies, w.staticCopies)
+                "%s,%s,%d,%s,%d,%.4f,%.4f,%d,%d,%d,%d,%d\n".format(Locale.ROOT, title, policy, maxFiles, r.name, w.end, w.remote, w.static, w.copies, w.staticCopies,
+                    w.memory?.pairs ?: 0L, w.memory?.pairBytes ?: 0L, w.memory?.locationBytes ?: 0L)
             }
         })
     }
@@ -140,6 +159,13 @@ fun main(args: Array<String>) {
         println("  %-${w}s %12.2f%% %12.2f%% %18.2f%% %12.2f%%".format(r.name,
             100.0 * aw / a.fileCount, 100.0 * at / a.fileCount, 100.0 * sw / s.fileCount, 100.0 * sa / s.fileCount))
     }
+    println("memory of the adaptive distributed placers, all servers, at the end and at the peak of the windows")
+    println("  " + "variant".padEnd(w) + "        pairs   pairs MB  locations MB   peak total MB")
+    for (r in runs) {
+        val m = (r.adaptive as? DistributedPlacer)?.memory ?: continue
+        val peak = r.windows.maxOf { (it.memory?.pairBytes ?: 0L) + (it.memory?.locationBytes ?: 0L) }
+        println("  %-${w}s %,12d %10.1f %13.1f %15.1f".format(r.name, m.pairs, m.pairBytes / 1e6, m.locationBytes / 1e6, peak / 1e6))
+    }
     println("protocol of the adaptive distributed placers (per traversal unless noted)")
     println("  " + "variant".padEnd(w) + "  messages  lookups  bounces  verified   evaluations   moves  refused  bad moves  predicted gain   true gain  max/avg load")
     for (r in runs) {
@@ -156,6 +182,13 @@ private val CENTRAL = setOf("central", "cent-near", "cent-rack", "near-rack")
 
 /** The variants that keep each file on two racks; their static baseline does too. */
 private val RACKED = setOf("cent-rack", "near-rack", "dist-near-rack")
+
+/** Cells per row of the sketch, per replica a server holds, and neighbours per replica, of the *-cms variants. */
+private const val CMS_CELLS = 4
+private const val CMS_NEIGHBOURS = 16
+
+/** Cells per replica and neighbours per replica of the cms-<c>-<m> variants. */
+private val CMS_SWEEP = listOf(1, 2, 4, 8, 16).flatMap { c -> listOf(4, 8, 16, 32).map { m -> c to m } }
 
 /** Servers per rack, for the rack variants and the availability table. */
 private const val RACK_SIZE = 4

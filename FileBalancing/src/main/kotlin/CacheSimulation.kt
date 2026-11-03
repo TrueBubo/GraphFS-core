@@ -176,7 +176,10 @@ private class WeightEviction(val adaptive: ReplicaPlacer, val static: ReplicaPla
     }
 }
 
-internal class Window(val end: Long, val miss: Double, val remote: Double, val static: Double, val copies: Long, val staticCopies: Long)
+internal class Window(
+    val end: Long, val miss: Double, val remote: Double, val static: Double, val copies: Long, val staticCopies: Long,
+    val memory: PairMemory? = null,
+)
 
 /** Keeps everything; the driver never has to evict. */
 private class NoEviction : Eviction {
@@ -268,7 +271,7 @@ internal class Policy(
         val a = adaptive.stats - lastA
         val s = static.stats - lastS
         windows += Window(adaptive.stats.traversals, pct(loads - lastLoads, touches - lastTouches),
-            pct(a.remote, a.traversals), pct(s.remote, s.traversals), a.copies, s.copies)
+            pct(a.remote, a.traversals), pct(s.remote, s.traversals), a.copies, s.copies, (adaptive as? DistributedPlacer)?.memory)
         lastA = adaptive.stats.copy()
         lastS = static.stats.copy()
         lastLoads = loads
