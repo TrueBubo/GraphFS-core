@@ -27,6 +27,14 @@ import kotlin.random.Random
  *  - oracle:    diagnosis only, the protocol with every location known exactly at no cost;
  *  - dist-near: notify8, and a new file goes on the servers of the file it was reached from;
  *  - dist-near-rack: dist-near, keeping every file on two racks;
+ *  - dist-req, dist-near-req: notify8 and dist-near, where a server that keeps reaching a file
+ *    also asks for a replica of it (requestMoves);
+ *  - demand, demand-near: [DemandPlacer], where every request carries the requester's distance
+ *    row and a replica whose debt reaches alpha moves to the server within the slack range that
+ *    its requesters' rows favour; demand-near also places a new file near; demand-near-rack
+ *    keeps every file on two racks too; demand-near-cms keeps the demand in a count-min sketch
+ *    per server of 4 rows of [CMS_CELLS] cells per replica it holds; their static baseline is a
+ *    DemandPlacer too;
  *  - notify8-cms, dist-near-cms: notify8 and dist-near with pairs in a count-min sketch
  *    ([SketchCounts]) of 4 rows of [CMS_CELLS] cells per replica a server holds, and 16 neighbours
  *    per replica; their static baseline is the same as for the exact ones;
@@ -114,6 +122,14 @@ fun main(args: Array<String>) {
         "both" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, verify = true, seed = 3) },
         "oracle" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, oracle = true, seed = 3) },
         "dist-near" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, seed = 3) },
+        "dist-req" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, requestMoves = true, seed = 3) },
+        "dist-near-req" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, requestMoves = true, seed = 3) },
+        "demand" to { a -> DemandPlacer(capacity, k, alpha = a, halfLife = halfLife, seed = 3) },
+        "demand-near" to { a -> DemandPlacer(capacity, k, alpha = a, halfLife = halfLife, placeNear = true, seed = 3) },
+        "demand-near-rack" to { a -> DemandPlacer(capacity, k, alpha = a, halfLife = halfLife, placeNear = true, racks = racks, seed = 3) },
+        "demand-near-cms" to { a ->
+            DemandPlacer(capacity, k, alpha = a, halfLife = halfLife, placeNear = true, sketchCells = CMS_CELLS * heldPerServer, seed = 3)
+        },
         "dist-near-rack" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, racks = racks, seed = 3) },
         "notify8-cms" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, pairCounts = sketch(CMS_CELLS, CMS_NEIGHBOURS), seed = 3) },
         "dist-near-cms" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, notify = 8, placeNear = true, pairCounts = sketch(CMS_CELLS, CMS_NEIGHBOURS), seed = 3) },
@@ -123,6 +139,7 @@ fun main(args: Array<String>) {
     val runs = variants.map { (label, make) ->
         val rk = if (label in RACKED) racks else null
         val static = if (label in CENTRAL) ReplicaPlacer(capacity, k, alpha = Double.POSITIVE_INFINITY, halfLife = halfLife, racks = rk, seed = 3)
+            else if (label in DEMAND) DemandPlacer(capacity, k, alpha = Double.POSITIVE_INFINITY, halfLife = halfLife, racks = rk, seed = 3)
             else DistributedPlacer(capacity, k, alpha = Double.POSITIVE_INFINITY, halfLife = halfLife, racks = rk, seed = 3)
         Policy(classicEviction(policy, files, maxFiles), make(alpha), static, maxFiles, files, label)
     }
@@ -167,21 +184,32 @@ fun main(args: Array<String>) {
         println("  %-${w}s %,12d %10.1f %13.1f %15.1f".format(r.name, m.pairs, m.pairBytes / 1e6, m.locationBytes / 1e6, peak / 1e6))
     }
     println("protocol of the adaptive distributed placers (per traversal unless noted)")
-    println("  " + "variant".padEnd(w) + "  messages  lookups  bounces  verified   evaluations   moves  refused  bad moves  predicted gain   true gain  max/avg load")
+    println("  " + "variant".padEnd(w) + "  messages  lookups  bounces  verified   evaluations   moves  refused  requests  granted  bad moves  predicted gain   true gain  max/avg load")
     for (r in runs) {
         val p = (r.adaptive as? DistributedPlacer)?.protocol ?: continue
         val t = r.adaptive.stats.traversals.toDouble()
-        println("  %-${w}s %10.3f %8.3f %8.3f %9.3f %13d %7d %8d %9.1f%% %15.0f %11.0f %13.3f".format(
+        println("  %-${w}s %10.3f %8.3f %8.3f %9.3f %13d %7d %8d %9d %8d %9.1f%% %15.0f %11.0f %13.3f".format(
             r.name, p.messages / t, p.lookups / t, p.redirects / t, p.verified / t, p.evaluations, p.moves, p.rejected,
-            pct(p.badMoves, p.moves), p.predictedGain, p.trueGain, (r.adaptive as DistributedPlacer).imbalance))
+            p.moveRequests, p.granted, pct(p.badMoves, p.moves), p.predictedGain, p.trueGain, (r.adaptive as DistributedPlacer).imbalance))
+    }
+    if (runs.none { it.adaptive is DemandPlacer }) return
+    println("demand placers: requests per traversal, decisions, moves, decisions that found the best server full, demand MB, max/avg load")
+    for (r in runs) {
+        val dp = r.adaptive as? DemandPlacer ?: continue
+        val p = dp.protocol
+        println("  %-${w}s %8.3f %13d %7d %8d %10.1f %13.3f".format(
+            r.name, p.requests / r.adaptive.stats.traversals.toDouble(), p.evaluations, p.moves, p.full, dp.demandBytes / 1e6, dp.imbalance))
     }
 }
 
 /** The variants that run ReplicaPlacer; their static baseline is a central one too. */
 private val CENTRAL = setOf("central", "cent-near", "cent-rack", "near-rack")
 
+/** The variants that run DemandPlacer; their static baseline is one too. */
+private val DEMAND = setOf("demand", "demand-near", "demand-near-rack", "demand-near-cms")
+
 /** The variants that keep each file on two racks; their static baseline does too. */
-private val RACKED = setOf("cent-rack", "near-rack", "dist-near-rack")
+private val RACKED = setOf("cent-rack", "near-rack", "dist-near-rack", "demand-near-rack")
 
 /** Cells per row of the sketch, per replica a server holds, and neighbours per replica, of the *-cms variants. */
 private const val CMS_CELLS = 4

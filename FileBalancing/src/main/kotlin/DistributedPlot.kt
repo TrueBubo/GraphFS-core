@@ -125,8 +125,11 @@ fun main(args: Array<String>) {
             subtitle = "notify8: a moved file tells its 8 heaviest neighbours; verify: check locations first; oracle: exact locations\n" +
                 "cent-near / dist-near: central / notify8, and a new file goes beside the file it was reached from\n" +
                 "cent-rack / near-rack / dist-near-rack: central / cent-near / dist-near, keeping every file on two racks\n" +
-                "notify8-cms / dist-near-cms: notify8 / dist-near, with pairs in a count-min sketch"
-            size = 1000 to 180 + 280 * ((summary.map { it.first }.distinct().size + 1) / 2)
+                "notify8-cms / dist-near-cms: notify8 / dist-near, with pairs in a count-min sketch\n" +
+                "dist-req / dist-near-req: notify8 / dist-near, and a server that keeps reaching a file may ask for a replica\n" +
+                "demand / demand-near / demand-near-rack: no pairs; a replica moves where its requesters' distance rows point\n" +
+                "demand-near-cms: demand-near, with the rows in a count-min sketch per server"
+            size = 1000 to 240 + 280 * ((summary.map { it.first }.distinct().size + 1) / 2)
         }
     }
     println(chart.save("saved.png", path = dir.path))

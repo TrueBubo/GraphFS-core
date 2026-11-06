@@ -15,6 +15,7 @@ algorithm; see [What we learned](#what-we-learned) for the short version.
 | `ReplicaPlacer.kt` | the central placer: sees the whole graph and the true placement |
 | `Placer.kt` | the interface both placers implement (add / remove file, traversal, stats) |
 | `DistributedPlacer.kt` | the same algorithm run by the servers, each knowing only its own files and what it learnt from traffic |
+| `DemandPlacer.kt` | a distributed placer without pairs: each replica sums its requesters' distance rows and moves where they point |
 | `PairCounts.kt` | what a distributed server remembers of traversed pairs: every pair, or a count-min sketch, behind one interface |
 | `PairMemoryCheck.kt` | the memory estimate of the distributed placer against the real heap |
 | `Eviction.kt` | cache eviction policies: LRU, FIFO, Random, CLOCK, LFU, SLRU, ARC, W-TinyLFU, Belady |
@@ -584,6 +585,44 @@ Protocol:
 5. New files go to the less loaded of two random servers (by the gossiped loads). Picking the
    least loaded of all made every home send a gossip round's new files to the same servers.
 6. A removed file tells its neighbours' servers, so they drop its pairs.
+7. `distances`: the same `n × n` matrix as the central placer, known to every server. A traversal
+   costs the distance between the two servers serving it, a request goes to the replica nearest
+   the requester, debts grow by the distance paid, and copies cost `α · distance`. Without it,
+   every choice is exactly as before (checked: identical `Main.kt` output).
+8. `requestMoves` (variants `dist-req`, `dist-near-req`): the servers that reach a file can also
+   ask for a replica of it.
+   - Each request carries the requester's distance to its *second choice*, the nearest other
+     replica of the file. A replica keeps one decayed sum and count per replica of its file:
+     its own slot holds the distances its requests paid, and slot `j` holds the second-choice
+     distances of the requests that would fall back to replica `j`. A local traversal counts as
+     a request at distance 0.
+   - The requester keeps the same sums for its own requests. Once it has paid α for a file, and
+     has room, it asks the replica it reaches (2 messages). That replica coordinates and pulls
+     the other replicas' sums (2 messages each).
+   - Moving replica `i` to the requester saves what the requester pays. The others served by
+     `i` go to their second choice, and lose the second-choice sums minus `i`'s own sum. Other
+     requesters are assumed not to gain from the new place, which makes the estimate
+     conservative. The best replica moves only if the estimate covers α times the copy distance.
+     There are no swaps on this path.
+   - After a move, the moved replica's sums and the other replicas' slot for it are cleared,
+     because they were distances to the old place.
+   - The sums record distances as they were, so they go stale when files move. Without
+     correction, on Twitter the coordinator predicted a loss of 2.5k where the world lost 636k.
+     The cause was neighbours that `improve` had just placed beside a replica: their past
+     requests counted as remote. The coordinator then chose exactly those replicas to give away.
+     With f's pairs (weight `w` per neighbour) carried by the move, at no extra message cost:
+     - each neighbour's replica on the old server forgets up to `w` of its requests;
+     - on the new server, it trades up to `w` for `w` local requests, and f's own sums start
+       from those;
+     - the sums of the server f left forget its share of what it paid to reach each neighbour.
+     Removing or evicting a file has the same effect on its servers' sums: its requests will not
+     come again. The coordinator subtracts the requester's share from a replica only up to what
+     that replica recorded.
+   - Result (LRU): on Twitter no request is granted, and `dist-req` / `dist-near-req` equal
+     `notify8` / `dist-near`. Nearly all of the requesters' apparent gain came from files that
+     were evicted. On Linux a few requests are granted (16 and 5): 18.2% and 58.3% saved,
+     against 18.3% and 58.5%. Before the corrections, Linux `dist-near-req` saved 61.0% on 46
+     granted moves, but Twitter `dist-req` lost 25.6% with 64% bad moves.
 
 `./gradlew distributed -Pdataset=wiki|twitter -Ppolicy=LRU|LFU`, charts with
 `./gradlew plotDistributed` into `docs/distributed/`.
@@ -659,6 +698,92 @@ messages per traversal on Linux.
   placers save 20 % and nothing. The file a new file is first reached from is usually one it
   keeps being traversed with: a header with its source file, a user with the account they
   answer.
+
+## Demand placement
+
+`DemandPlacer` (variants `demand`, `demand-near`) drops the pair graph. A replica learns where it
+is wanted from the requests it serves.
+
+- **Requests carry distance rows.** A traversal u → v is served by the cheapest pair of replicas,
+  u's on server a and v's on b (ties at random), priced as in the central placer. Each side is a
+  request to the other. A request carries, for each
+  server t, the distance from t to the requesting file's nearest replica: what the traversal would
+  cost if the requested replica stood on t.
+- **One array per replica.** A replica keeps the decayed sum of the rows it was sent, `n` doubles.
+  `row[h]` is what its requests paid on its own server h, and `row[t]` what they would pay on t. The
+  rows do not depend on where the replica is, so the array stays true after a move.
+- **Debt.** Each replica adds the distances its requests paid. When the debt reaches α / k, its
+  share of a copy as in `DistributedPlacer`, it is paid off: the debt resets and the replica decides, from its own array alone. It moves to the server t
+  within the slack range, below `(1 + slack)` times its share of the replicas, that maximises
+  `row[h] − row[t] − α · copy distance`, if that is positive.
+- **Conservative.** A requester nearer another replica than t would go there instead, and other
+  replicas' requesters that t would suit are left out.
+- **Racks.** With `racks` (variant `demand-near-rack`), every file keeps replicas on at least two
+  racks, as in `DistributedPlacer`. A new replica avoids the rack all the others are in, and a
+  replica does not move to the target that would leave all of them in one rack.
+- **Simplified.** Locations and loads are exact (as `oracle`), caps count live replicas only, and
+  there are no swaps. Messages are not counted, but each request carries `n` numbers.
+- **Merged rows.** Sending the row of the requesting server alone split a file's demand among
+  its k servers. On Linux, LRU, that saved 4.5% (`demand`) and 56.5% (`demand-near`).
+
+Results, LRU, saved % against a static placer of the same kind:
+
+| | notify8 | **demand** | dist-near | **demand-near** | dist-near-rack | **demand-near-rack** |
+|---|---:|---:|---:|---:|---:|---:|
+| Wikipedia, 10 M traversals | 10.3 | 8.8 | 39.6 | 39.5 | 39.4 | 39.2 |
+| Twitter | −2.3 | 0.1 | 50.2 | **52.8** | 50.4 | **53.1** |
+| Linux | 18.3 | 11.4 | 58.5 | 60.0 | **61.2** | 60.2 |
+
+Deciding at α / k instead of α triples the decisions but adds only 10–30% more moves. It changes
+the savings by under 1.5 points either way: Linux and Wikipedia gain a little, Twitter loses 0.7.
+
+Keeping files on two racks costs little. Without it, 18–20% of the files have every replica in one
+rack (lost if that rack fails); with it, none do.
+
+With near placement, demand placement is about as good as pair-based placement, and better on
+Twitter. It needs neither pairs, nor location caches, nor gossip, and its memory is `n` doubles per
+replica (37 MB for Wikipedia's 200,000 replicas on 16 servers). Without near placement it moves
+rarely (3,415 moves on Linux against 7,866 for `notify8`). A replica sees only the servers that
+request it, and with uniform costs every other server is equally far, so few servers stand out.
+
+### Demand in a count-min sketch
+
+With `sketchCells` (variant `demand-near-cms`), replicas keep no rows. Each server keeps one
+`DecayingSketch` instead, the sketch of `SketchCounts` taken out into its own class. It is keyed
+by (file, server t) and holds t's decayed *nearness* to the requesters: the farthest distance
+minus the row's entry. The best target is then the server with the largest nearness, and with
+uniform costs a request raises only the k counters of the requester's servers.
+
+- A replica keeps its own server's nearness exactly. The gain of moving to t is t's estimate minus
+  that. Collisions can only overstate t, so they lead to more moves, never fewer.
+- A replica that moves takes its estimates along. The new server raises each counter to *at
+  least* the estimate. Adding them instead counted again what stale counters from an earlier stay
+  still held: in the fuzz test a file moving back and forth inflated them until a float overflowed.
+- A request still carries the whole row, and a decision reads all n servers from the sketch, so
+  the time per traversal stays O(n). Only memory stops growing with n.
+
+LRU, 4 cells per row per replica a server holds (as `dist-near-cms`):
+
+| | demand-near: saved % | moves | demand MB | demand-near-cms: saved % | moves | demand MB |
+|---|---:|---:|---:|---:|---:|---:|
+| Wikipedia | 39.5 | 2,210 | 36.8 | 40.2 | 20,931 | 24.8 |
+| Twitter | 52.8 | 128 | 3.7 | 52.8 | 133 | 2.9 |
+| Linux | 60.0 | 1,120 | 3.7 | 61.2 | 2,677 | 2.9 |
+
+The sketch saves as much or a little more, but on Wikipedia it moves ten times as often:
+overstated targets act like a lower bar for a move. With 16 servers it saves only a third of
+the memory, since a row is only 16 numbers. It pays with many servers (`Latency.kt`, Wikipedia,
+3M traversals, 1.94M replicas):
+
+| servers | demand kept in | demand memory | mean | p99 | p99.99 |
+|---:|---|---:|---:|---:|---:|
+| 16 | rows | 358 MB | 0.44 µs | 0.9 µs | 7 µs |
+| 16 | sketch, 2¹⁹ cells per row | 212 MB | 0.90 µs | 2.7 µs | 10 µs |
+| 1,000 | rows | 15,652 MB | 5.77 µs | 12.0 µs | 26 µs |
+| 1,000 | sketch, 2¹³ cells per row | 209 MB | 13.9 µs | 86 µs | 144 µs |
+
+With 1,000 servers the sketch needs 75 times less memory, but traversals take 2.4 times as long:
+a decision reads n estimates of 4 counters each instead of n doubles.
 
 ## Rack spreading
 
@@ -822,6 +947,35 @@ half-life 1M, every file added on first traversal), the time of each `addEdge` c
 | central | 10M (1.57M) | incremental | 1.04 µs | 11.0 µs | 85 µs | 73 ms |
 | distributed (dist-near) | 3M (0.97M) | full, every 2¹⁸ | 3.28 µs | 27.2 µs | 188 µs | 582 ms |
 | distributed (dist-near) | 3M (0.97M) | incremental | 3.61 µs | 30.4 µs | 198 µs | 80 ms |
+| demand (demand-near) | 3M (0.97M) | none | 0.42 µs | 0.9 µs | 9 µs | 15 ms |
+| demand (demand-near) | 10M (1.57M) | none | 0.47 µs | 1.0 µs | 6 µs | 14 ms |
+
+`DemandPlacer` is about 2× faster than the central placer on average, 8× faster than the
+distributed one, and an order of magnitude faster in the tail. A traversal adds one row of 16
+numbers to each of the two replicas, and, when a debt is paid off, scans the 16 servers. It has
+no pairs, so it needs no sweep and no pruning, and it has no heap. Its slowest calls (10–15 ms, two
+in 10M) are hash-table growth and garbage collection. Unlike the others, its work per traversal
+grows linearly with the number of servers.
+
+With 1,000 servers instead of 16 (`Latency <dir> <placer> 3000000 0 1000`, 3M traversals, 0.97M
+files):
+
+| placer | servers | mean | p99 | p99.99 | max |
+|---|---:|---:|---:|---:|---:|
+| central | 16 | 0.65 µs | 6.3 µs | 78 µs | 20 ms |
+| central | 1,000 | 2.47 µs | 23.9 µs | 102 µs | 75 ms |
+| distributed (dist-near) | 16 | 3.84 µs | 31.0 µs | 201 µs | 78 ms |
+| distributed (dist-near) | 1,000 | 20.6 µs | 274 µs | 1.7 ms | 89 ms |
+| demand (demand-near) | 16 | 0.43 µs | 0.9 µs | 7 µs | 14 ms |
+| demand (demand-near) | 1,000 | 5.83 µs | 12.0 µs | 27 µs | 3.3 ms |
+
+- **Demand placement slows down 14×**, as expected from its O(n) rows, and its mean falls behind
+  the central placer's. It stays 3.5× faster than the distributed placer on average, and has the
+  shortest tail of the three: it does the same work on every traversal, with no sweep and no large
+  evaluations.
+- **Its memory grows the same way.** Each replica keeps 1,000 doubles (8 KB): about 16 GB for
+  these 1.94M replicas, against 0.4 GB with 16 servers. A count-min sketch per server brings it
+  down to 0.2 GB, but not the time (see [Demand in a count-min sketch](#demand-in-a-count-min-sketch)).
 
 - **The periodic stalls are gone.** The full sweeps were the slowest calls, and they grew with
   the graph: in the central placer 108 ms at 1M traversals and 367 ms at 9.4M; in the
@@ -964,6 +1118,7 @@ own run.
 | `grace` | 0 | Traversals a server may stay down before its files are repaired (when `minReplicas < k`). A bit longer than a typical restart. |
 | `distances` | `null` | `n × n` symmetric distances between servers, zero on the diagonal. `null` is a uniform network (distance 1) and uses the faster 0/1 formula. |
 | `placeNear` | false | `addFile(file, near)` puts the new file's replicas on `near`'s servers that are at least two below their cap; the rest go to the least loaded servers. |
+| `requestMoves` | false | `DistributedPlacer` only: a server that keeps reaching a file asks for a replica of it, and gets one if the estimated saving, second choices included, covers the copy. |
 | `racks` | `null` | Rack id of each server. When two racks have a live server, every file keeps live replicas on at least two racks, so one rack failing cannot take all copies (see [Rack spreading](#rack-spreading)). |
 | `seed` | 1 | Tie-breaking and sampling; runs are deterministic. |
 
