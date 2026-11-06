@@ -18,6 +18,16 @@ fun main() {
     distributedFuzz(notify = 8, placeNear = true, racks = intArrayOf(0, 0, 1, 1, 2, 2, 3, 3))
     distributedFuzz(verify = true)
     distributedFuzz(notify = 8, placeNear = true, pairCounts = { SketchCounts(it, 64, neighbours = 4) })
+    distributedFuzz(requestMoves = true)
+    distributedFuzz(notify = 8, placeNear = true, requestMoves = true, racks = intArrayOf(0, 0, 1, 1, 2, 2, 3, 3), distances = randomDistances(8, Random(47)))
+    distributedFuzz(replicaCount = 1, requestMoves = true, distances = randomDistances(8, Random(53)))
+    demandFuzz()
+    demandFuzz(placeNear = true, distances = randomDistances(8, Random(59)))
+    demandFuzz(replicaCount = 1, distances = randomDistances(8, Random(61)))
+    demandFuzz(placeNear = true, racks = intArrayOf(0, 0, 1, 1, 2, 2, 3, 3))
+    demandFuzz(placeNear = true, racks = intArrayOf(0, 0, 0, 0, 1, 1, 1, 1), distances = randomDistances(8, Random(67)))
+    demandFuzz(placeNear = true, sketchCells = 64)
+    demandFuzz(placeNear = true, racks = intArrayOf(0, 0, 1, 1, 2, 2, 3, 3), distances = randomDistances(8, Random(71)), sketchCells = 16)
     sketchCheck()
     simulation()
     lruSimulation()
@@ -316,11 +326,12 @@ fun sketchCheck() {
  */
 fun distributedFuzz(
     notify: Int = 0, verify: Boolean = false, placeNear: Boolean = false, racks: IntArray? = null,
-    pairCounts: (Double) -> PairCounts = ::ExactCounts,
+    pairCounts: (Double) -> PairCounts = ::ExactCounts, requestMoves: Boolean = false,
+    distances: Array<DoubleArray>? = null, replicaCount: Int = 2,
 ) {
     val p = DistributedPlacer(
-        IntArray(8) { 60 }, 2, alpha = 2.0, halfLife = 50.0, gossipEvery = 20, notify = notify, verify = verify,
-        placeNear = placeNear, racks = racks, pairCounts = pairCounts, seed = 31,
+        IntArray(8) { 60 }, replicaCount, alpha = 2.0, halfLife = 50.0, gossipEvery = 20, notify = notify, verify = verify,
+        placeNear = placeNear, racks = racks, distances = distances, requestMoves = requestMoves, pairCounts = pairCounts, seed = 31,
     )
     p.sweepEvery = 64
     val rnd = Random(37)
@@ -357,9 +368,59 @@ fun distributedFuzz(
         }
         p.checkInvariants()
     }
-    println("== distributed fuzz (notify = $notify, verify = $verify, placeNear = $placeNear, racks = ${racks != null}): $steps random steps, " +
-        "invariants held; ${p.fileCount} files, ${p.protocol.moves} moves, ${p.stats.remote} remote traversals, " +
+    println("== distributed fuzz (k = $replicaCount, notify = $notify, verify = $verify, placeNear = $placeNear, racks = ${racks != null}, " +
+        "requestMoves = $requestMoves, distances = ${distances != null}): $steps random steps, " +
+        "invariants held; ${p.fileCount} files, ${p.protocol.moves} moves (${p.protocol.granted} of ${p.protocol.moveRequests} requests granted), " +
+        "${p.stats.remote} remote traversals, " +
         "$restores restores with ${p.stats.rebalanceCopies} copies ==")
+    println()
+}
+
+/** [distributedFuzz] for [DemandPlacer]. */
+fun demandFuzz(
+    placeNear: Boolean = false, racks: IntArray? = null, distances: Array<DoubleArray>? = null, replicaCount: Int = 2, sketchCells: Int = 0,
+) {
+    val p = DemandPlacer(
+        IntArray(8) { 60 }, replicaCount, alpha = 2.0, halfLife = 50.0, slack = 0.1, placeNear = placeNear, racks = racks,
+        distances = distances, sketchCells = sketchCells, seed = 31,
+    )
+    val rnd = Random(37)
+    val live = ArrayList<Int>()
+    val gone = LinkedHashMap<Int, IntArray>()             // removed files and the servers they stay stored on
+    var nextFile = 0
+    var restores = 0
+    val steps = 30_000
+    for (step in 1..steps) {
+        val r = rnd.nextDouble()
+        when {
+            live.size < 2 || r < 0.02 && live.size < 150 -> {
+                if (gone.isNotEmpty() && rnd.nextBoolean()) {
+                    val f = gone.keys.elementAt(rnd.nextInt(gone.size))
+                    p.restoreFile(f, gone.remove(f)!!)
+                    live.add(f)
+                    restores++
+                } else {
+                    p.addFile(nextFile, if (live.isEmpty()) -1 else live[rnd.nextInt(live.size)])
+                    live.add(nextFile++)
+                }
+            }
+            r < 0.03 -> {
+                val f = live.removeAt(rnd.nextInt(live.size))
+                gone[f] = p.replicasOf(f).toIntArray()
+                p.evictFile(f)
+            }
+            else -> {
+                val u = live[rnd.nextInt(live.size)]
+                val v = live.getOrNull(live.indexOf(u) + 1 + rnd.nextInt(3)) ?: live[rnd.nextInt(live.size)]
+                p.addEdge(u to v)
+            }
+        }
+        p.checkInvariants()
+    }
+    println("== demand fuzz (k = $replicaCount, placeNear = $placeNear, racks = ${racks != null}, distances = ${distances != null}, sketchCells = $sketchCells): $steps random steps, " +
+        "invariants held; ${p.fileCount} files, ${p.protocol.moves} moves of ${p.protocol.evaluations} decisions " +
+        "(${p.protocol.full} found the best server full), ${p.stats.remote} remote traversals, " +
+        "$restores restores with ${p.stats.rebalanceCopies} copies, max/avg load ${"%.2f".format(p.imbalance)} ==")
     println()
 }
 

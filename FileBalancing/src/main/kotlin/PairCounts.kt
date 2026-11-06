@@ -113,13 +113,8 @@ class ExactCounts(private val lambda: Double) : PairCounts {
  * A sketch cannot forget one pair. When a replica moves or leaves, its pairs stay in the counters
  * of the old server until they fade; they count again only if the file comes back there.
  */
-class SketchCounts(private val lambda: Double, cellsPerRow: Int, private val neighbours: Int = 16) : PairCounts {
-    private val rowBits = 32 - (maxOf(cellsPerRow, 2) - 1).countLeadingZeroBits()   // rounded up to a power of 2
-    private val mask = (1 shl rowBits) - 1
-    private val cells = FloatArray(DEPTH shl rowBits)
-    private var base = 0L
-    private var scaledAt = 0L
-    private var scale = 1.0
+class SketchCounts(lambda: Double, cellsPerRow: Int, private val neighbours: Int = 16) : PairCounts {
+    private val sketch = DecayingSketch(lambda, cellsPerRow)
 
     init {
         require(neighbours >= 1) { "neighbours must be >= 1" }
@@ -144,7 +139,7 @@ class SketchCounts(private val lambda: Double, cellsPerRow: Int, private val nei
             var at = 0
             var least = Double.POSITIVE_INFINITY
             for (i in 0 until count) {
-                val w = estimate(hash(file, ids[i]), now)
+                val w = sketch.estimate(file, ids[i], now)
                 if (w < least) {
                     least = w
                     at = i
@@ -154,16 +149,15 @@ class SketchCounts(private val lambda: Double, cellsPerRow: Int, private val nei
         }
 
         override fun add(g: Int, now: Long) {
-            val h = hash(file, g)
-            val w = raise(h, 1.0, now)
+            val w = sketch.raise(file, g, 1.0, now)
             if (index(g) >= 0) return
             if (count < neighbours) return append(g)
             val at = lightest(now)
-            if (estimate(hash(file, ids[at]), now) < w) ids[at] = g
+            if (sketch.estimate(file, ids[at], now) < w) ids[at] = g
         }
 
         fun adopt(g: Int, weight: Double, now: Long) {
-            raise(hash(file, g), weight, now)
+            sketch.raise(file, g, weight, now)
             append(g)
         }
 
@@ -177,14 +171,14 @@ class SketchCounts(private val lambda: Double, cellsPerRow: Int, private val nei
         }
 
         override fun forEach(now: Long, action: PairAction) {
-            for (i in 0 until count) action.accept(ids[i], estimate(hash(file, ids[i]), now))
+            for (i in 0 until count) action.accept(ids[i], sketch.estimate(file, ids[i], now))
         }
 
         override fun forEachLive(now: Long, action: PairAction) {
             var i = count
             while (--i >= 0) {
                 val g = ids[i]
-                val w = estimate(hash(file, g), now)
+                val w = sketch.estimate(file, g, now)
                 if (w < PRUNE) drop(i) else action.accept(g, w)
             }
         }
@@ -201,7 +195,44 @@ class SketchCounts(private val lambda: Double, cellsPerRow: Int, private val nei
         return here
     }
 
-    override val bytes: Long get() = OBJECT + arrayBytes(cells.size, 4)
+    override val bytes: Long get() = sketch.bytes
+
+    private companion object {
+        val EMPTY = IntArray(0)
+        const val PAIRS_OBJECT = 32L
+    }
+}
+
+/**
+ * A count-min sketch of decayed weights keyed by a pair of ints, as described at [SketchCounts]:
+ * 32-bit float counters in forward-decay units, conservative updates, [DEPTH] rows of
+ * [cellsPerRow] cells (rounded up to a power of 2). An estimate is never below the true weight.
+ */
+class DecayingSketch(private val lambda: Double, cellsPerRow: Int) {
+    private val rowBits = 32 - (maxOf(cellsPerRow, 2) - 1).countLeadingZeroBits()   // rounded up to a power of 2
+    private val mask = (1 shl rowBits) - 1
+    private val cells = FloatArray(DEPTH shl rowBits)
+    private var base = 0L
+    private var scaledAt = 0L
+    private var scale = 1.0
+
+    /** The weight of the pair ([f], [g]) at [now], or more. */
+    fun estimate(f: Int, g: Int, now: Long): Double = estimate(hash(f, g), now)
+
+    /** Adds [weight] to the pair ([f], [g]) by conservative update; returns its new estimate. */
+    fun raise(f: Int, g: Int, weight: Double, now: Long): Double = raise(hash(f, g), weight, now)
+
+    /** Raises the pair ([f], [g]) to at least [weight], without adding to what it holds already. */
+    fun atLeast(f: Int, g: Int, weight: Double, now: Long) {
+        val h = hash(f, g)
+        val target = (weight * scaleAt(now)).toFloat()
+        for (r in 0 until DEPTH) {
+            val c = cell(r, h)
+            if (cells[c] < target) cells[c] = target
+        }
+    }
+
+    val bytes: Long get() = OBJECT + arrayBytes(cells.size, 4)
 
     /** Forward-decay units per unit of weight at [now]; rebases first if they would overflow a float. */
     private fun scaleAt(now: Long): Double {
@@ -245,8 +276,6 @@ class SketchCounts(private val lambda: Double, cellsPerRow: Int, private val nei
     private companion object {
         const val DEPTH = 4
         val REBASE = 40 * ln(2.0)                          // units up to 2^40: a float holds them with room to spare
-        val EMPTY = IntArray(0)
-        const val PAIRS_OBJECT = 32L
         const val OBJECT = 72L
 
         /** A 64-bit mix of the directed pair; two hashes for the rows, by double hashing. */
