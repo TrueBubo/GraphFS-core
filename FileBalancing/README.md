@@ -16,6 +16,7 @@ algorithm; see [What we learned](#what-we-learned) for the short version.
 | `Placer.kt` | the interface both placers implement (add / remove file, traversal, stats) |
 | `DistributedPlacer.kt` | the same algorithm run by the servers, each knowing only its own files and what it learnt from traffic |
 | `DemandPlacer.kt` | a distributed placer without pairs: each replica sums its requesters' distance rows and moves where they point |
+| `StreamPlacer.kt` | a central placer that places files by the scores of streaming graph partitioning (LDG, Fennel), with restreaming |
 | `PairCounts.kt` | what a distributed server remembers of traversed pairs: every pair, or a count-min sketch, behind one interface |
 | `PairMemoryCheck.kt` | the memory estimate of the distributed placer against the real heap |
 | `Eviction.kt` | cache eviction policies: LRU, FIFO, Random, CLOCK, LFU, SLRU, ARC, W-TinyLFU, Belady |
@@ -24,7 +25,7 @@ algorithm; see [What we learned](#what-we-learned) for the short version.
 | `TwitterSimulation.kt` | SNAP Higgs Twitter interactions replay |
 | `LinuxSimulation.kt` | Linux kernel history replay: files changed in one commit are traversed together |
 | `DistributedSimulation.kt` | central vs distributed placer on the same traces |
-| `CachePlot.kt`, `DistributedPlot.kt` | Kandy charts of the results, into `docs/` |
+| `CachePlot.kt`, `DistributedPlot.kt`, `StreamPlot.kt` | Kandy charts of the results, into `docs/` |
 | `Scaling.kt` | time and memory as files and traversals grow |
 | `Latency.kt` | the time of each traversal, to find the slowest ones |
 
@@ -785,6 +786,112 @@ the memory, since a row is only 16 numbers. It pays with many servers (`Latency.
 With 1,000 servers the sketch needs 75 times less memory, but traversals take 2.4 times as long:
 a decision reads n estimates of 4 counters each instead of n doubles.
 
+## Streaming partitioning scores
+
+`StreamPlacer` (variants `ldg*`, `fennel*` in `DistributedSimulation`) asks whether the scores of
+one-pass graph partitioning place files better than our gains. It has the central view (decayed
+pair weights, every replica) and one primitive: place a file. Each of its k replicas goes in turn
+to the server with the best score, where `w(p)` is the weight of the file's pairs with files that
+have a replica on `p`:
+
+- **LDG** (Stanton and Kliot, KDD 2012): `w(p) · (1 − load(p) / cap(p))`.
+- **Fennel** (Tsourakakis et al., WSDM 2014): `w(p) − a·γ·load(p)^(γ−1)`, γ = 1.5,
+  `a = scale · √n · W / R^γ` (their `√k · m / n^1.5`, with servers, pair weight and replicas). A larger
+  `scale` trades cut for balance.
+- With `marginal` (`-m`), a replica only counts the pairs the replicas before it leave remote.
+
+The primitive is used three ways:
+
+- **admission**: a new file is placed with the file it was reached from as its one neighbour
+  (weight 1), a soft near placement. With `-near` (`nearFirst`), the near file's servers below
+  their cap take the replicas whatever the score, as in cent-near, and only the rest are scored;
+- **moves** (`-moves`): when a file's remote traversals reach α it is placed again, and the new
+  place is taken if the pair weight it makes local covers α per copy (rent-or-buy, as in
+  `ReplicaPlacer`);
+- **restreaming** (`-restream`, Nishimura and Ugander, KDD 2013): every half-life, every file is
+  placed again in stream order, with the current placement of all others as context. The new place
+  is taken if the gain covers θ·α per copy (`-restream-<θ>`; `-restream` is θ = 1), or always
+  (`-restream-free`, restreaming as published: it does not charge for moving).
+
+LRU, 16 servers, `k = 2`, α = 8, cost `remote + 8 · copies` (Linux and Twitter 10,000 files,
+Wikipedia 100,000 files and 10M traversals):
+
+| total cost | Linux | Twitter | Wikipedia |
+|---|---:|---:|---:|
+| central | 822,786 | 426,215 | 6,869,611 |
+| **cent-near** (`ReplicaPlacer`, near placement) | **342,107** | 190,198 | 4,527,826 |
+| ldg (admission only) | 447,788 | 198,323 | 4,956,451 |
+| ldg-moves | 378,419 | 192,101 | 4,690,764 |
+| ldg-m-moves | 373,159 | 192,729 | 4,563,133 |
+| ldg-m-restream-0.5 | 359,591 | 192,340 | 4,507,990 |
+| ldg-m-restream-0.25 | 376,989 | 214,693 | **4,487,417** |
+| fennel-16.0 (moves) | 353,671 | 191,037 | 4,690,287 |
+| fennel-64.0 (moves) | 457,293 | **177,757** | 4,698,637 |
+| fennel-m-16.0 (moves) | 581,343 | 177,804 | 4,767,434 |
+| ldg-near-m-restream-0.5 | 351,518 | 192,082 | 4,513,225 |
+| fennel-near-m-moves | 352,913 | 181,633 | 4,560,458 |
+| fennel-near-m-64.0 | 363,233 | 179,187 | 4,562,689 |
+| ldg-restream-free | 820,586 | 1,317,565 | 10,498,337 |
+
+Totals of these runs are in `data/stream.csv` (`./gradlew distributed -Pdataset=… -Pvariants=…
+-PtotalsCsv=data/stream.csv`), charts with `./gradlew plotStream` into `docs/stream/`.
+
+![Total cost of the streaming scores against cent-near](docs/stream/stream-cost.png)
+
+- **No score beats our placer everywhere.** The best stream variant is 3.4 % more expensive than
+  cent-near on Linux, 6.5 % cheaper on Twitter (Fennel) and 0.9 % cheaper on Wikipedia (LDG with
+  restreaming at θ = 0.25), and a different one wins each dataset. Admission alone (ldg and fennel are the same
+  there: one neighbour of weight 1 outweighs any size penalty) is 4–31 % worse than cent-near: the
+  score cannot see more than near placement does when a file has only one known neighbour.
+- **Where the second replica goes matters most.** Counting all pairs puts both replicas beside the
+  neighbour's two, which Linux's dense clusters reward; counting marginal pairs lets Fennel's size
+  penalty send the second replica elsewhere, where it later meets other neighbours. Twitter's hubs
+  reward that: fennel-m saves 6.5 % against cent-near there, and costs 70 % more on Linux. LDG
+  multiplies the penalty by the weight, so with no marginal weight it ties and falls back to all
+  pairs: ldg-m-moves stays within 3 % of ldg-moves, and is the cheaper on Linux and Wikipedia.
+- **Fennel's scale is the cut-against-balance knob it promises.** On Linux (moves, all pairs):
+
+  | scale | 0.25 | 4 | 16 | 64 | 256 | 1024 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | total cost | 403,016 | 398,463 | **353,671** | 457,293 | 610,084 | 744,589 |
+  | max / average load | 1.054 | 1.074 | 1.077 | 1.024 | 1.015 | 1.010 |
+  | debt triggers | 24,491 | 24,722 | 26,180 | 36,044 | 51,588 | 65,380 |
+
+  ![Fennel's scale: cost and balance](docs/stream/stream-fennel.png)
+
+  The hard cap already holds balance within 10 %, so the penalty only helps while it is small
+  against a pair's weight; past that it keeps files away from their neighbours, more traversals are
+  remote, and more triggers fire. On Twitter the best scale is 64, on Wikipedia it makes no
+  difference.
+- **Restreaming as published does not pay when moving costs.** A free pass every half-life lifts
+  locality almost to cent-near's (81 % local on Linux against 82 %, and 73 % for admission alone),
+  which is the gap to offline partitioning it is known to close, but it copies 60,000–750,000
+  replicas for it, and costs 2.2–6.9 times as much as ldg-moves. Taking only re-placements that
+  cover α (θ = 1) moves almost nothing the debt triggers had not moved (29–250 copies over all
+  passes). Halving the bar (θ = 0.5) is the one setting that helps: −3.6 % on Linux and −1.2 % on
+  Wikipedia against ldg-m-moves, −0.2 % on Twitter. θ = 0.25 is better still on Wikipedia (−1.7 %,
+  whose pairs repeat steadily) but already worse than moves alone on Linux (+1.0 %) and Twitter
+  (+11 %), and θ = 0 (any gain) loses everywhere.
+
+  ![Restreaming by the bar on a move's gain](docs/stream/stream-restream.png)
+- **Near placement as a rule fixes Fennel's marginal scoring, and otherwise changes little.** As a
+  soft weight of 1, the near file places a new file's first replica, but with `-m` the second has
+  no weight left anywhere, and Fennel's size penalty sends it away from the near file's other
+  server. That is what made fennel-m 70 % worse than cent-near on Linux. Putting the replicas on
+  the near file's servers first brings fennel-near-m-moves to +3.2 % on Linux, +0.7 % on Wikipedia
+  and −4.5 % on Twitter. That makes it the most even stream variant, though it never beats the best
+  one per dataset. LDG's second replica already falls back to all pairs, so the rule saves at most
+  5 % on Linux (ldg-near-m-restream-0.5 is +2.8 % against cent-near, the best LDG there) and moves
+  LDG by under 1.5 % on Twitter and Wikipedia. With all-pairs Fennel
+  on Linux, the rule costs more (fennel-near-16.0 is +14.5 % against +3.4 %): it saves 21,000 remote
+  traversals but fills the near servers, so 7,700 evicted files that come back cannot stay where they
+  were stored and are copied (222 without the rule).
+
+  ![Near placement in StreamPlacer](docs/stream/stream-near.png)
+
+`streamFuzz` in `Main.kt` runs 30,000 random steps with each score (restreaming on, once free, once
+with `nearFirst`) and checks the invariants after each.
+
 ## Rack spreading
 
 With `racks` (a rack id per server), the central placer keeps each file's live replicas on at
@@ -1100,7 +1207,8 @@ repartitioning.
 ### What would be worth measuring
 
 Hermes-style greedy migration (our placer with the threshold at zero) would show directly how
-much the rent-or-buy trigger saves. Ja-Be-Ja is the right rival for the distributed placer, also
+much the rent-or-buy trigger saves; restreaming with any gain (`-restream-0.0`, see
+[Streaming partitioning scores](#streaming-partitioning-scores)) is close to it, and loses. Ja-Be-Ja is the right rival for the distributed placer, also
 in messages per traversal. A Spinner-style per-window repartition would be the offline reference.
 SPAR's fixed-`k` form is our near placement, and Social Hash is offline, so neither needs its
 own run.

@@ -28,6 +28,10 @@ fun main() {
     demandFuzz(placeNear = true, racks = intArrayOf(0, 0, 0, 0, 1, 1, 1, 1), distances = randomDistances(8, Random(67)))
     demandFuzz(placeNear = true, sketchCells = 64)
     demandFuzz(placeNear = true, racks = intArrayOf(0, 0, 1, 1, 2, 2, 3, 3), distances = randomDistances(8, Random(71)), sketchCells = 16)
+    streamFuzz(StreamPlacer.Score.LDG)
+    streamFuzz(StreamPlacer.Score.FENNEL, restreamFree = true)
+    streamFuzz(StreamPlacer.Score.FENNEL, replicaCount = 3)
+    streamFuzz(StreamPlacer.Score.FENNEL, nearFirst = true)
     sketchCheck()
     simulation()
     lruSimulation()
@@ -421,6 +425,50 @@ fun demandFuzz(
         "invariants held; ${p.fileCount} files, ${p.protocol.moves} moves of ${p.protocol.evaluations} decisions " +
         "(${p.protocol.full} found the best server full), ${p.stats.remote} remote traversals, " +
         "$restores restores with ${p.stats.rebalanceCopies} copies, max/avg load ${"%.2f".format(p.imbalance)} ==")
+    println()
+}
+
+/** [distributedFuzz] for [StreamPlacer], restreaming every 500 traversals. */
+fun streamFuzz(score: StreamPlacer.Score, replicaCount: Int = 2, restreamFree: Boolean = false, nearFirst: Boolean = false) {
+    val p = StreamPlacer(
+        IntArray(8) { 60 }, replicaCount, alpha = 2.0, halfLife = 50.0, score = score, nearFirst = nearFirst, restreamEvery = 500, restreamFree = restreamFree,
+        seed = 31,
+    )
+    val rnd = Random(37)
+    val live = ArrayList<Int>()
+    val gone = LinkedHashMap<Int, IntArray>()
+    var nextFile = 0
+    val steps = 30_000
+    for (step in 1..steps) {
+        val r = rnd.nextDouble()
+        when {
+            live.size < 2 || r < 0.02 && live.size < 150 -> {
+                if (gone.isNotEmpty() && rnd.nextBoolean()) {
+                    val f = gone.keys.elementAt(rnd.nextInt(gone.size))
+                    p.restoreFile(f, gone.remove(f)!!)
+                    live.add(f)
+                } else {
+                    p.addFile(nextFile, if (live.isEmpty()) -1 else live[rnd.nextInt(live.size)])
+                    live.add(nextFile++)
+                }
+            }
+            r < 0.03 -> {
+                val f = live.removeAt(rnd.nextInt(live.size))
+                gone[f] = p.replicasOf(f).toIntArray()
+                p.evictFile(f)
+            }
+            else -> {
+                val u = live[rnd.nextInt(live.size)]
+                val v = live.getOrNull(live.indexOf(u) + 1 + rnd.nextInt(3)) ?: live[rnd.nextInt(live.size)]
+                p.addEdge(u to v)
+            }
+        }
+        p.checkInvariants()
+    }
+    val pr = p.protocol
+    println("== stream fuzz ($score, k = $replicaCount, restreamFree = $restreamFree, nearFirst = $nearFirst): $steps random steps, invariants held; " +
+        "${p.fileCount} files, ${pr.triggerMoves} of ${pr.triggers} triggers moved, ${pr.passes} passes moved ${pr.restreamMoves} files " +
+        "(${pr.restreamCopies} copies), ${p.stats.remote} remote traversals, max/avg load ${"%.2f".format(p.imbalance)} ==")
     println()
 }
 
