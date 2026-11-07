@@ -35,6 +35,9 @@ import kotlin.random.Random
  *    keeps every file on two racks too; demand-near-cms keeps the demand in a count-min sketch
  *    per server of 4 rows of [CMS_CELLS] cells per replica it holds; their static baseline is a
  *    DemandPlacer too;
+ *  - ldg, fennel and their -moves, -restream, -restream-free; fennel-<scale>: [StreamPlacer], which
+ *    places files by the scores of streaming partitioning (see STREAM below); their static
+ *    baseline is the central one;
  *  - notify8-cms, dist-near-cms: notify8 and dist-near with pairs in a count-min sketch
  *    ([SketchCounts]) of 4 rows of [CMS_CELLS] cells per replica a server holds, and 16 neighbours
  *    per replica; their static baseline is the same as for the exact ones;
@@ -114,6 +117,7 @@ fun main(args: Array<String>) {
     val variants: List<Pair<String, (Double) -> Placer>> = listOf<Pair<String, (Double) -> Placer>>(
         "central" to { a -> ReplicaPlacer(capacity, k, alpha = a, halfLife = halfLife, seed = 3) },
         "cent-near" to { a -> ReplicaPlacer(capacity, k, alpha = a, halfLife = halfLife, placeNear = true, seed = 3) },
+        *STREAM.map { (name, make) -> name to { a: Double -> make(capacity, k, a, halfLife) as Placer } }.toTypedArray(),
         "cent-rack" to { a -> ReplicaPlacer(capacity, k, alpha = a, halfLife = halfLife, racks = racks, seed = 3) },
         "near-rack" to { a -> ReplicaPlacer(capacity, k, alpha = a, halfLife = halfLife, racks = racks, placeNear = true, seed = 3) },
         "distrib" to { a -> DistributedPlacer(capacity, k, alpha = a, halfLife = halfLife, seed = 3) },
@@ -192,6 +196,25 @@ fun main(args: Array<String>) {
             r.name, p.messages / t, p.lookups / t, p.redirects / t, p.verified / t, p.evaluations, p.moves, p.rejected,
             p.moveRequests, p.granted, pct(p.badMoves, p.moves), p.predictedGain, p.trueGain, (r.adaptive as DistributedPlacer).imbalance))
     }
+    // -DtotalsCsv=<file>: one row of totals per variant, for StreamPlot.
+    System.getProperty("totalsCsv")?.takeIf { it.isNotEmpty() }?.let(::File)?.let { f ->
+        if (!f.exists()) f.writeText("dataset,policy,maxFiles,variant,traversals,remote,copies,cost,staticCost,imbalance\n")
+        f.appendText(runs.joinToString("") { r ->
+            val st = r.adaptive.stats
+            val imbalance = (r.adaptive as? StreamPlacer)?.imbalance ?: Double.NaN
+            "%s,%s,%d,%s,%d,%d,%d,%.1f,%.1f,%.4f\n".format(Locale.ROOT, title, policy, maxFiles, r.name, st.traversals, st.remote, st.copies,
+                r.adaptiveCost(alpha), r.staticCost(alpha), imbalance)
+        })
+    }
+    if (runs.any { it.adaptive is StreamPlacer }) {
+        println("stream placers: debt triggers (taken), restreaming passes, files placed again (taken, copies), max/avg load")
+        for (r in runs) {
+            val sp = r.adaptive as? StreamPlacer ?: continue
+            val p = sp.protocol
+            println("  %-${w}s %9d (%,d) %6d %12d (%,d, %,d) %8.3f".format(
+                r.name, p.triggers, p.triggerMoves, p.passes, p.restreamed, p.restreamMoves, p.restreamCopies, sp.imbalance))
+        }
+    }
     if (runs.none { it.adaptive is DemandPlacer }) return
     println("demand placers: requests per traversal, decisions, moves, decisions that found the best server full, demand MB, max/avg load")
     for (r in runs) {
@@ -203,7 +226,52 @@ fun main(args: Array<String>) {
 }
 
 /** The variants that run ReplicaPlacer; their static baseline is a central one too. */
-private val CENTRAL = setOf("central", "cent-near", "cent-rack", "near-rack")
+private val CENTRAL by lazy { setOf("central", "cent-near", "cent-rack", "near-rack") + STREAM.map { it.first } }
+
+/** The [STREAM] variants that also run with -near (and their all-pairs counterparts). */
+private val NEAR_OF = listOf("ldg-m", "ldg-m-moves", "ldg-m-restream-0.5", "ldg-m-restream-0.25", "fennel-m-moves", "fennel-m-16.0", "fennel-m-64.0")
+
+/**
+ * The [StreamPlacer] variants: ldg / fennel place new files by their score and never move them;
+ * -moves also places a file again when its debt reaches alpha, taking the new place if the gain
+ * covers the copies; -restream also restreams every half-life with that rule, -restream-<t> with
+ * alpha scaled by t, -restream-free without any rule (and no debt moves), as restreaming is
+ * usually run; fennel-<s> is fennel-moves with its size penalty scaled by s; -m scores a replica
+ * by the pairs the ones before it leave remote (marginal).
+ */
+private val STREAM: List<Pair<String, (IntArray, Int, Double, Double) -> StreamPlacer>> = listOf(false, true).flatMap { m ->
+    val sfx = if (m) "-m" else ""
+    listOf(StreamPlacer.Score.LDG to "ldg", StreamPlacer.Score.FENNEL to "fennel").flatMap { (score, name) ->
+        listOf(
+            "$name$sfx" to { c: IntArray, k: Int, a: Double, h: Double -> StreamPlacer(c, k, a, h, score = score, moves = false, marginal = m, seed = 3) },
+            "$name$sfx-moves" to { c, k, a, h -> StreamPlacer(c, k, a, h, score = score, marginal = m, seed = 3) },
+            "$name$sfx-restream" to { c, k, a, h -> StreamPlacer(c, k, a, h, score = score, restreamEvery = h.toLong(), marginal = m, seed = 3) },
+            "$name$sfx-restream-free" to { c, k, a, h ->
+                StreamPlacer(c, k, a, h, score = score, moves = false, restreamEvery = h.toLong(), restreamFree = true, marginal = m, seed = 3)
+            },
+        ) + listOf(0.0, 0.25, 0.5).map { t ->
+            "$name$sfx-restream-$t" to { c: IntArray, k: Int, a: Double, h: Double ->
+                StreamPlacer(c, k, a, h, score = score, restreamEvery = h.toLong(), restreamThreshold = t, marginal = m, seed = 3)
+            }
+        }
+    } + listOf(0.25, 4.0, 16.0, 64.0, 256.0, 1024.0).map { sc ->
+        "fennel$sfx-$sc" to { c: IntArray, k: Int, a: Double, h: Double ->
+            StreamPlacer(c, k, a, h, score = StreamPlacer.Score.FENNEL, fennelScale = sc, marginal = m, seed = 3)
+        }
+    }
+}.let { all ->
+    // <name>-near: the same with a new file put on its near file's servers first, as cent-near does.
+    all + all.filter { (name, _) -> NEAR_OF.any { name == it || name == it.replaceFirst("-m", "") } }.map { (name, make) ->
+        val score = name.substringBefore('-')
+        name.replaceFirst(score, "$score-near") to { c: IntArray, k: Int, a: Double, h: Double ->
+            make(c, k, a, h).run {
+                StreamPlacer(c, k, a, h, score = this.score, fennelScale = fennelScale, nearFirst = true, moves = moves,
+                    restreamEvery = restreamEvery, restreamThreshold = restreamThreshold, marginal = marginal, seed = 3)
+            }
+        }
+    }
+}
+
 
 /** The variants that run DemandPlacer; their static baseline is one too. */
 private val DEMAND = setOf("demand", "demand-near", "demand-near-rack", "demand-near-cms")

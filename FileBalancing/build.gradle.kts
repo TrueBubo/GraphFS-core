@@ -87,11 +87,12 @@ tasks.register<JavaExec>("plotCaches") {
         listOf("twitter/sweep.csv", "wikipedia/sweep.csv", "linux/sweep.csv").map { data.file(it).asFile }.filter { it.exists() }.map { it.path })
 }
 
-/** ./gradlew distributed -Pdataset=twitter|wiki|linux [-PmaxFiles=...] [-Ppolicy=LRU] [-Pcsv=...] [-Pvariants=a,b]: central vs distributed placement. */
+/** ./gradlew distributed -Pdataset=twitter|wiki|linux [-PmaxFiles=...] [-Ppolicy=LRU] [-Pcsv=...] [-Pvariants=a,b] [-PtotalsCsv=data/stream.csv]: central vs distributed placement. */
 tasks.register<JavaExec>("distributed") {
     mainClass = "DistributedSimulationKt"
     classpath = sourceSets.main.get().runtimeClasspath
     maxHeapSize = "16g"
+    findProperty("totalsCsv")?.let { systemProperty("totalsCsv", file(it.toString()).absolutePath) }   // totals per variant, for plotStream
     val data = layout.projectDirectory.dir("data")
     val dataset = (findProperty("dataset") ?: "twitter").toString()
     val wiki = dataset == "wiki"
@@ -124,4 +125,11 @@ tasks.register<JavaExec>("plotDistributed") {
     val data = layout.projectDirectory.dir("data")
     args(listOf(layout.projectDirectory.dir("docs/distributed").asFile.path) +
         listOf("distributed.csv", "distributed-memory.csv", "distributed-sweep.csv").map { data.file(it).asFile }.filter { it.exists() }.map { it.path })
+}
+
+/** ./gradlew plotStream: charts of data/stream.csv (distributed runs of the StreamPlacer variants with -PtotalsCsv) into docs/stream/. */
+tasks.register<JavaExec>("plotStream") {
+    mainClass = "StreamPlotKt"
+    classpath = sourceSets.main.get().runtimeClasspath
+    args(layout.projectDirectory.dir("docs/stream").asFile.path, layout.projectDirectory.file("data/stream.csv").asFile.path)
 }
