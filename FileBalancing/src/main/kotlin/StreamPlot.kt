@@ -3,7 +3,6 @@ import org.jetbrains.kotlinx.dataframe.api.dataFrameOf
 import org.jetbrains.kotlinx.kandy.dsl.categorical
 import org.jetbrains.kotlinx.kandy.dsl.continuous
 import org.jetbrains.kotlinx.kandy.dsl.plot
-import org.jetbrains.kotlinx.kandy.letsplot.export.save
 import org.jetbrains.kotlinx.kandy.letsplot.feature.CoordinatesTransformation
 import org.jetbrains.kotlinx.kandy.letsplot.feature.Position
 import org.jetbrains.kotlinx.kandy.letsplot.feature.position
@@ -27,10 +26,10 @@ import java.io.File
 /**
  * Charts of the [StreamPlacer] runs: the rows DistributedSimulation appends with -DtotalsCsv, one
  * per dataset and variant. Usage: StreamPlot <output dir> <stream.csv>.
- *  - stream-cost.png: total cost of the main variants, per dataset, with the change against cent-near;
- *  - stream-fennel.png: Fennel's size penalty scale against cost (relative to cent-near) and balance;
- *  - stream-restream.png: restreaming by how much of a copy a re-placement must gain, against no restreaming;
- *  - stream-near.png: each variant against its -near version (a new file on its near file's servers first).
+ *  - stream-cost.pdf: total cost of the main variants, per dataset, with the change against cent-near;
+ *  - stream-fennel.pdf: Fennel's size penalty scale against cost (relative to cent-near) and balance;
+ *  - stream-restream.pdf: restreaming by how much of a copy a re-placement must gain, against no restreaming;
+ *  - stream-near.pdf: each variant against its -near version (a new file on its near file's servers first).
  */
 fun main(args: Array<String>) {
     require(args.size == 2) { "usage: StreamPlot <output dir> <stream.csv>" }
@@ -90,7 +89,7 @@ fun main(args: Array<String>) {
             size = 1100 to 560
         }
     }
-    println(costChart.save("stream-cost.png", path = dir.path))
+    println(costChart.savePdf("stream-cost", dir))
 
     // Fennel's scale: cost relative to cent-near, and balance, for all and marginal pairs.
     val sweep = ArrayList<List<Any>>()
@@ -147,7 +146,7 @@ fun main(args: Array<String>) {
             size = 1100 to 620
         }
     }
-    println(fennelChart.save("stream-fennel.png", path = dir.path))
+    println(fennelChart.savePdf("stream-fennel", dir))
 
     // Restreaming: cost against the same score without restreaming, by the bar a re-placement must clear.
     val steps = listOf("none" to "-moves", "1" to "-restream", "0.5" to "-restream-0.5", "0.25" to "-restream-0.25", "0" to "-restream-0.0", "free" to "-restream-free")
@@ -194,7 +193,7 @@ fun main(args: Array<String>) {
             size = 1100 to 440
         }
     }
-    println(restreamChart.save("stream-restream.png", path = dir.path))
+    println(restreamChart.savePdf("stream-restream", dir))
 
     // Near placement: each variant's cost against cent-near's, with the score alone and near first.
     val pairs = datasets.flatMap { d ->
@@ -234,7 +233,7 @@ fun main(args: Array<String>) {
             size = 1100 to 520
         }
     }
-    println(nearChart.save("stream-near.png", path = dir.path))
+    println(nearChart.savePdf("stream-near", dir))
 }
 
 private fun familyOf(v: String) = when {
@@ -250,7 +249,7 @@ private val MAIN = listOf(
     "cent-near", "ldg", "ldg-moves", "ldg-m-moves", "ldg-m-restream-0.5", "ldg-m-restream-0.25", "fennel-moves", "fennel-16.0", "fennel-64.0", "fennel-m-16.0",
 )
 
-/** Variants of stream-near.png, from top to bottom, each also run as <score>-near-... */
+/** Variants of stream-near.pdf, from top to bottom, each also run as <score>-near-... */
 private val NEAR = listOf(
     "ldg", "ldg-moves", "ldg-m-moves", "ldg-m-restream-0.5", "ldg-m-restream-0.25", "fennel-moves", "fennel-16.0", "fennel-64.0", "fennel-m-moves", "fennel-m-16.0",
 )
@@ -271,7 +270,7 @@ private val FENNEL: Color = Color.hex("#eb6834")
 
 private val FAMILIES = linkedMapOf("ReplicaPlacer" to REFERENCE, "LDG (StreamPlacer)" to LDG, "Fennel (StreamPlacer)" to FENNEL)
 
-/** Lines of stream-restream.png: colour by score, dashed for marginal pairs. */
+/** Lines of stream-restream.pdf: colour by score, dashed for marginal pairs. */
 private val SCORES = linkedMapOf(
     "ldg" to (LDG to LineType.SOLID),
     "ldg-m" to (LDG to LineType.DASHED),
