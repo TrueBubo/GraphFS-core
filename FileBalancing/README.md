@@ -836,7 +836,7 @@ Wikipedia 100,000 files and 10M traversals):
 Totals of these runs are in `data/stream.csv` (`./gradlew distributed -Pdataset=… -Pvariants=…
 -PtotalsCsv=data/stream.csv`), charts with `./gradlew plotStream` into `docs/stream/`.
 
-![Total cost of the streaming scores against cent-near](docs/stream/stream-cost.png)
+[Total cost of the streaming scores against cent-near (PDF)](docs/stream/stream-cost.pdf)
 
 - **No score beats our placer everywhere.** The best stream variant is 3.4 % more expensive than
   cent-near on Linux, 6.5 % cheaper on Twitter (Fennel) and 0.9 % cheaper on Wikipedia (LDG with
@@ -857,7 +857,7 @@ Totals of these runs are in `data/stream.csv` (`./gradlew distributed -Pdataset=
   | max / average load | 1.054 | 1.074 | 1.077 | 1.024 | 1.015 | 1.010 |
   | debt triggers | 24,491 | 24,722 | 26,180 | 36,044 | 51,588 | 65,380 |
 
-  ![Fennel's scale: cost and balance](docs/stream/stream-fennel.png)
+  [Fennel's scale: cost and balance (PDF)](docs/stream/stream-fennel.pdf)
 
   The hard cap already holds balance within 10 %, so the penalty only helps while it is small
   against a pair's weight; past that it keeps files away from their neighbours, more traversals are
@@ -873,7 +873,7 @@ Totals of these runs are in `data/stream.csv` (`./gradlew distributed -Pdataset=
   whose pairs repeat steadily) but already worse than moves alone on Linux (+1.0 %) and Twitter
   (+11 %), and θ = 0 (any gain) loses everywhere.
 
-  ![Restreaming by the bar on a move's gain](docs/stream/stream-restream.png)
+  [Restreaming by the bar on a move's gain (PDF)](docs/stream/stream-restream.pdf)
 - **Near placement as a rule fixes Fennel's marginal scoring, and otherwise changes little.** As a
   soft weight of 1, the near file places a new file's first replica, but with `-m` the second has
   no weight left anywhere, and Fennel's size penalty sends it away from the near file's other
@@ -887,7 +887,7 @@ Totals of these runs are in `data/stream.csv` (`./gradlew distributed -Pdataset=
   traversals but fills the near servers, so 7,700 evicted files that come back cannot stay where they
   were stored and are copied (222 without the rule).
 
-  ![Near placement in StreamPlacer](docs/stream/stream-near.png)
+  [Near placement in StreamPlacer (PDF)](docs/stream/stream-near.pdf)
 
 `streamFuzz` in `Main.kt` runs 30,000 random steps with each score (restreaming on, once free, once
 with `nearFirst`) and checks the invariants after each.
@@ -981,8 +981,8 @@ placers keep exact pairs, so all variants of a dataset share a baseline.
 | | 2,000,000 | 1,314 MB | 526 MB | 1,758 MB | 922 MB | 49.1 | 48.8 |
 | | 3,267,066 | 1,378 MB | 843 MB | 1,822 MB | 1,236 MB | 49.1 | 48.9 |
 
-(`data/distributed-memory.csv`. Charts in `docs/distributed/`: `memory.png`, `memory-scaling.png`,
-`memory-tradeoff.png`; the `*-cms` variants are also in the existing ones.)
+(`data/distributed-memory.csv`. Charts in `docs/distributed/`: `memory.pdf`, `memory-scaling.pdf`,
+`memory-tradeoff.pdf`; the `*-cms` variants are also in the existing ones.)
 
 - **The saving grows with the pairs per file.** Up to 3.2 times less for pairs on Wikipedia (1M
   files) and 2.4 on Linux, for 0.5 points of saved cost. Twitter has few pairs per file, so most of

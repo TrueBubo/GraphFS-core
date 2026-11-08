@@ -5,7 +5,6 @@ import org.jetbrains.kotlinx.kandy.dsl.continuousPos
 import org.jetbrains.kotlinx.kandy.dsl.plot
 import org.jetbrains.kotlinx.kandy.ir.Plot
 import org.jetbrains.kotlinx.kandy.ir.scale.Scale
-import org.jetbrains.kotlinx.kandy.letsplot.export.save
 import org.jetbrains.kotlinx.kandy.letsplot.feature.layout
 import org.jetbrains.kotlinx.kandy.letsplot.layers.line
 import org.jetbrains.kotlinx.kandy.letsplot.layers.points
@@ -20,7 +19,7 @@ import java.io.File
  * Charts of cache-size sweeps: the csv rows CacheSimulation appends, one run per maxFiles.
  * Usage: CachePlot <output dir> <sweep.csv>... For each dataset and metric (miss%, local% of the
  * adaptive placer, total cost of the adaptive and of the static placer, cost saved by adapting) one
- * PNG against the cache size (log scale).
+ * chart (PDF) against the cache size (log scale).
  *
  * Every policy is drawn, so no set of hues could keep them apart; instead each policy gets a
  * panel (small multiples) where it is the one coloured line and the other policies are faint grey
@@ -110,7 +109,7 @@ fun main(args: Array<String>) {
                     size = 1000 to 820
                 }
             }
-            println(chart.save("$slug-${column.removeSuffix("Pct")}.png", path = dir.path))
+            println(chart.savePdf("$slug-${column.removeSuffix("Pct")}", dir))
         }
     }
 }

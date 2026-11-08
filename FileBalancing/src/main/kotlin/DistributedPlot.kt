@@ -2,7 +2,6 @@ import org.jetbrains.kotlinx.dataframe.api.column
 import org.jetbrains.kotlinx.dataframe.api.dataFrameOf
 import org.jetbrains.kotlinx.kandy.dsl.categorical
 import org.jetbrains.kotlinx.kandy.dsl.plot
-import org.jetbrains.kotlinx.kandy.letsplot.export.save
 import org.jetbrains.kotlinx.kandy.letsplot.feature.CoordinatesTransformation
 import org.jetbrains.kotlinx.kandy.letsplot.feature.coordinatesTransformation
 import org.jetbrains.kotlinx.kandy.letsplot.feature.layout
@@ -24,10 +23,10 @@ import java.io.File
  *    placer dark dashed;
  *  - two summaries per dataset and policy: each variant's total cost (bar) beside its static
  *    placer's (dark point), and the cost saved against that static placer;
- *  - memory.png: the peak memory of each distributed variant, for pairs and for locations;
- *  - with [memory csv], the same rows for several cache sizes: memory-scaling.png, memory and
+ *  - memory.pdf: the peak memory of each distributed variant, for pairs and for locations;
+ *  - with [memory csv], the same rows for several cache sizes: memory-scaling.pdf, memory and
  *    cost saved of exact pairs and the sketch as the number of files grows;
- *  - with [sweep csv], the same rows for several sketch sizes: memory-tradeoff.png, cost saved
+ *  - with [sweep csv], the same rows for several sketch sizes: memory-tradeoff.pdf, cost saved
  *    against memory.
  */
 fun main(args: Array<String>) {
@@ -98,7 +97,7 @@ fun main(args: Array<String>) {
             }
         }
         val slug = "$dataset-$policy".lowercase().replace(Regex("[^a-z0-9]+"), "-")
-        println(chart.save("$slug.png", path = dir.path))
+        println(chart.savePdf(slug, dir))
 
         for (v in variants) {
             val (cost, base) = totalCost(byVariant.getValue(v), alpha)
@@ -132,7 +131,7 @@ fun main(args: Array<String>) {
             size = 1000 to 240 + 280 * ((summary.map { it.first }.distinct().size + 1) / 2)
         }
     }
-    println(chart.save("saved.png", path = dir.path))
+    println(chart.savePdf("saved", dir))
 
     val cf = dataFrameOf(
         "panel" to costs.map { it[0] as String }, "variant" to costs.map { it[1] as String },
@@ -160,7 +159,7 @@ fun main(args: Array<String>) {
             size = 1000 to 180 + 280 * ((costs.map { it[0] }.distinct().size + 1) / 2)
         }
     }
-    println(costChart.save("cost.png", path = dir.path))
+    println(costChart.savePdf("cost", dir))
 
     memoryChart(rows, dir)
     args.getOrNull(2)?.let { scalingChart(readRows(it), alpha, dir) }
@@ -225,7 +224,7 @@ private fun memoryChart(rows: List<Map<String, String>>, dir: File) {
             size = 1000 to 180 + 330 * ((out.map { it[0] }.distinct().size + 1) / 2)
         }
     }
-    println(chart.save("memory.png", path = dir.path))
+    println(chart.savePdf("memory", dir))
 }
 
 /** Pair memory, total memory and cost saved as the cache grows, one column of panels per dataset. */
@@ -268,7 +267,7 @@ private fun scalingChart(rows: List<Map<String, String>>, alpha: Double, dir: Fi
             size = 1000 to 760
         }
     }
-    println(chart.save("memory-scaling.png", path = dir.path))
+    println(chart.savePdf("memory-scaling", dir))
 }
 
 /** Cost saved against pair memory for each sketch size, with the exact pairs as the reference. */
@@ -302,7 +301,7 @@ private fun tradeoffChart(rows: List<Map<String, String>>, alpha: Double, dir: F
             size = 1000 to 460
         }
     }
-    println(chart.save("memory-tradeoff.png", path = dir.path))
+    println(chart.savePdf("memory-tradeoff", dir))
 }
 
 private val FOCUS: Color = Color.hex("#2a78d6")
